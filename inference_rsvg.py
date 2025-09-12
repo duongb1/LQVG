@@ -24,7 +24,7 @@ from torch.utils.data import DataLoader
 from tools.colormap import colormap
 
 # os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH")
-os.environ["CUDA_VISIBLE_DEVICES"] = '2'
+#os.environ["CUDA_VISIBLE_DEVICES"] = '1'
 
 # colormap
 color_list = colormap()
@@ -65,7 +65,7 @@ def main(args):
     print('number of params:', n_parameters)
 
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         missing_keys, unexpected_keys = model.load_state_dict(checkpoint['model'], strict=False)
         unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
         if len(missing_keys) > 0:

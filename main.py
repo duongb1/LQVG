@@ -11,9 +11,6 @@ import os
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
-from argparse import Namespace
-from torch.serialization import add_safe_globals
-add_safe_globals([Namespace])
 
 import util.misc as utils
 import datasets.samplers as samplers
