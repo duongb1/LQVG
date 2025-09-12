@@ -6,6 +6,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from argparse import Namespace
+from torch.serialization import add_safe_globals
+add_safe_globals([Namespace])
 
 import util.misc as utils
 from util.misc import AverageMeter
