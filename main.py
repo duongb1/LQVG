@@ -94,19 +94,14 @@ def main(args):
     # build train  dataset
     if args.dataset_file != "all":
         dataset_train = build_dataset(args.dataset_file, image_set='train', args=args)
-        print('trainset:', len(dataset_train))
     else:
         dataset_names = ["refcoco", "refcoco+", "refcocog"]
         dataset_train = torch.utils.data.ConcatDataset(
             [build_dataset(name, image_set="train", args=args) for name in dataset_names]
         )
 
-    # dataset_train = build_dataset(args.dataset_file, image_set='train', args=args)
-    print('trainset:', len(dataset_train))
+    print(f"\nTrain dataset sample number: {len(dataset_train)}\n")
 
-
-    print("\nTrain dataset sample number: ", len(dataset_train))
-    print("\n")
 
     if args.distributed:
         if args.cache_mode:
