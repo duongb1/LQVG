@@ -15,6 +15,7 @@ from einops import rearrange
 from util.misc import NestedTensor, is_main_process
 
 from .position_encoding import build_position_encoding
+from torchvision.models import ResNet50_Weights, ResNet101_Weights
 
 
 class FrozenBatchNorm2d(torch.nn.Module):
@@ -91,9 +92,24 @@ class Backbone(BackboneBase):
                  train_backbone: bool,
                  return_interm_layers: bool,
                  dilation: bool):
-        backbone = getattr(torchvision.models, name)(
-            replace_stride_with_dilation=[False, False, dilation],
-            pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d)
+        
+        # Use new weights API
+        kwargs = {
+            'replace_stride_with_dilation': [False, False, dilation],
+            'norm_layer': FrozenBatchNorm2d
+        }
+        
+        if is_main_process():
+            if name == 'resnet50':
+                kwargs['weights'] = ResNet50_Weights.DEFAULT
+            elif name == 'resnet101':
+                kwargs['weights'] = ResNet101_Weights.DEFAULT
+            else:
+                kwargs['weights'] = None
+        else:
+            kwargs['weights'] = None
+            
+        backbone = getattr(torchvision.models, name)(**kwargs)
         assert name not in ('resnet18', 'resnet34'), "number of channels are hard coded"
         super().__init__(backbone, train_backbone, return_interm_layers)
         if dilation:
