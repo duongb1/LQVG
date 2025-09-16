@@ -1,30 +1,26 @@
 import argparse
 import datetime
 import json
+import os
 import random
 import time
 from pathlib import Path
-from collections import namedtuple
-from functools import partial
 
-import os
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+from argparse import Namespace
+from torch.serialization import add_safe_globals
+from torch.utils.data import DataLoader
 
 import util.misc as utils
 import datasets.samplers as samplers
-#from datasets.coco_eval import CocoEvaluator
-from datasets import build_dataset, get_coco_api_from_dataset
+from datasets import build_dataset
 from engine import train_one_epoch
 from models import build_model
-from models.postprocessors import build_postprocessors
 from tools.load_pretrained_weights import pre_trained_model_to_finetune
 import opts
-# os.environ["CUDA_VISIBLE_DEVICES"] = '7'
-# os.environ["CUDA_VISIBLE_DEVICES"] = '4,5'
-# os.environ["CUDA_VISIBLE_DEVICES"] = '6,7'
-#
+
+add_safe_globals([Namespace])
 def main(args):
     # set environ
     os.environ["MDETR_CPU_REDUCE"] = "1"

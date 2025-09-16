@@ -1,30 +1,23 @@
 import argparse
-import json
+import os
 import random
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
 from argparse import Namespace
+from PIL import Image, ImageDraw
 from torch.serialization import add_safe_globals
-add_safe_globals([Namespace])
+from torch.utils.data import DataLoader
 
 import util.misc as utils
 from util.misc import AverageMeter
+from datasets import build_dataset
 from models import build_model
-import torchvision.transforms as T
-import matplotlib.pyplot as plt
-import os
-from PIL import Image, ImageDraw, ImageFont
-from datasets import build_dataset, get_coco_api_from_dataset
-import opts
-from torch.utils.data import DataLoader
-
 from tools.colormap import colormap
+import opts
 
-# os.environ.pop("QT_QPA_PLATFORM_PLUGIN_PATH")
-#os.environ["CUDA_VISIBLE_DEVICES"] = '1'
+add_safe_globals([Namespace])
 
 # colormap
 color_list = colormap()
@@ -258,7 +251,7 @@ def bbox_iou(box1, box2):
 
     return (inter_area + 1e-6) / (union_area + 1e-6), inter_area, union_area
 
-# visuaize functions
+# visualize functions
 def box_cxcywh_to_xyxy(x):
     x_c, y_c, w, h = x.unbind(0)
     b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
