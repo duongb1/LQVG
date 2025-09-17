@@ -37,6 +37,8 @@ class SetCriterion(nn.Module):
         self.register_buffer('empty_weight', empty_weight)
         self.focal_alpha = focal_alpha
         self.mask_out_stride = 4
+        self.lambda_heatmap = 2.0
+        self.lambda_iou = 1.0
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (NLL)
@@ -145,6 +147,47 @@ class SetCriterion(nn.Module):
         }
         return losses
 
+    def loss_dsgl(self, outputs, targets, indices, num_boxes):
+        if 'pred_heatmap' not in outputs or 'pred_iou' not in outputs:
+            device = next(iter(outputs.values())).device
+            return {'loss_dsgl': torch.zeros([], device=device)}
+
+        src_heatmap = outputs['pred_heatmap'].transpose(1, 2)
+        src_iou = outputs['pred_iou'].transpose(1, 2)
+        idx = self._get_src_permutation_idx(indices)
+
+        if src_heatmap.numel() == 0:
+            zero = src_heatmap.sum()
+            return {'loss_dsgl': zero}
+
+        batch_idx, _ = idx
+        src_heatmap = src_heatmap[idx].reshape(-1, *src_heatmap.shape[-2:])
+        src_iou = src_iou[idx].reshape(-1)
+
+        target_heatmap = torch.stack([t['heatmap'] for t in targets], dim=0).to(src_heatmap.device)
+        target_heatmap = target_heatmap[batch_idx].reshape(-1, *target_heatmap.shape[-2:])
+
+        target_valid = torch.stack([t['valid'] for t in targets], dim=0).to(src_iou.device)
+        target_valid = target_valid[batch_idx].reshape(-1).bool()
+
+        pred_boxes = outputs['pred_boxes'].transpose(1, 2)[idx].reshape(-1, 4)
+        target_boxes = torch.stack([t['boxes'] for t in targets], dim=0).to(pred_boxes.device)
+        target_boxes = target_boxes[batch_idx].reshape(-1, 4)
+
+        if target_valid.any():
+            heatmap_loss = F.mse_loss(src_heatmap[target_valid], target_heatmap[target_valid])
+
+            pred_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(pred_boxes[target_valid])
+            target_boxes_xyxy = box_ops.box_cxcywh_to_xyxy(target_boxes[target_valid])
+            iou_targets = box_ops.clip_iou(pred_boxes_xyxy, target_boxes_xyxy).detach()
+            iou_loss = F.mse_loss(src_iou[target_valid], iou_targets)
+        else:
+            heatmap_loss = src_heatmap.sum() * 0
+            iou_loss = src_iou.sum() * 0
+
+        loss_dsgl = self.lambda_heatmap * heatmap_loss + self.lambda_iou * iou_loss
+        return {'loss_dsgl': loss_dsgl}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -161,7 +204,8 @@ class SetCriterion(nn.Module):
         loss_map = {
             'labels': self.loss_labels,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
+            'masks': self.loss_masks,
+            'dsgl': self.loss_dsgl
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

@@ -202,6 +202,9 @@ def main(args):
                      'epoch': epoch,
                      'n_parameters': n_parameters}
 
+        if 'loss_dsgl' in train_stats:
+            log_stats['loss_dsgl'] = train_stats['loss_dsgl']
+
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats, default=float) + "\n")
