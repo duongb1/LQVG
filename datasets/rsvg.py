@@ -17,6 +17,19 @@ import random
 import torch
 from pathlib import Path
 
+
+def generate_gaussian_heatmap(box, size=32, sigma=1.5):
+    """Create a gaussian heatmap centered at the normalized box center."""
+    cx, cy, _, _ = box
+    cx = np.clip(cx * size, 0, size - 1)
+    cy = np.clip(cy * size, 0, size - 1)
+
+    xs = np.arange(size, dtype=np.float32)
+    ys = np.arange(size, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    heatmap = np.exp(-((grid_x - cx) ** 2 + (grid_y - cy) ** 2) / (2 * sigma ** 2))
+    return heatmap.astype(np.float32)
+
 def filelist(root, file_type):
     return [os.path.join(directory_path, f) for directory_path, directory_name, files in os.walk(root) for f in files if f.endswith(file_type)]
 
@@ -95,6 +108,19 @@ class RSVGDataset(data.Dataset):
         # Norm, to tensor
         if self.transform is not None:
             img, target = self.transform(img, target)
+
+        boxes = target.get("boxes")
+        valids = target.get("valid")
+        if boxes is not None and valids is not None:
+            heatmap_size = 32
+            heatmap_tensor = torch.zeros((boxes.shape[0], heatmap_size, heatmap_size), dtype=torch.float32)
+            for idx, (box, valid_flag) in enumerate(zip(boxes, valids)):
+                if valid_flag.item() > 0:
+                    heatmap_np = generate_gaussian_heatmap(box.cpu().numpy(), size=heatmap_size)
+                    heatmap_tensor[idx] = torch.from_numpy(heatmap_np)
+            target["heatmap"] = heatmap_tensor
+        else:
+            target["heatmap"] = torch.zeros((0, 32, 32), dtype=torch.float32)
 
         if self.testmode:
             return img.unsqueeze(0), target, dw, dh, img_path, ratio

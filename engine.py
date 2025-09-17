@@ -28,8 +28,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         captions = [t["caption"] for t in targets]
         targets = utils.targets_to(targets, device)
 
-        outputs = model(samples, captions, targets) 
+        outputs = model(samples, captions, targets)
         loss_dict = criterion(outputs, targets)
+
+        if 'loss_dsgl' in loss_dict:
+            metric_logger.update(loss_dsgl=loss_dict['loss_dsgl'].item())
 
         weight_dict = criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)

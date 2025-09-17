@@ -17,6 +17,7 @@ from .segmentation import VisionLanguageFusionModule
 from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
+from .dsgl import DSGL
 
 from transformers import BertTokenizer, BertModel, RobertaModel, RobertaTokenizerFast
 
@@ -121,6 +122,7 @@ class LQVG(nn.Module):
 
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
+        self.dsgl = DSGL(embed_dim=hidden_dim, heatmap_size=32)
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -264,6 +266,14 @@ class LQVG(nn.Module):
         out['pred_logits'] = outputs_class[-1]  # [batch_size, time, num_queries_per_frame, num_classes]
         out['pred_boxes'] = outputs_coord[-1]  # [batch_size, time, num_queries_per_frame, 4]
 
+        last_layer_embeds = hs[-1]
+        pred_heatmap, pred_iou = self.dsgl(last_layer_embeds)
+        pred_heatmap = rearrange(pred_heatmap, '(b t) q h w -> b t q h w', b=b, t=t)
+        pred_iou = rearrange(pred_iou.squeeze(-1), '(b t) q -> b t q', b=b, t=t)
+
+        out['pred_heatmap'] = pred_heatmap
+        out['pred_iou'] = pred_iou
+
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
 
@@ -387,6 +397,7 @@ def build(args):
     weight_dict['loss_ce'] = args.cls_loss_coef
     weight_dict['loss_bbox'] = args.bbox_loss_coef
     weight_dict['loss_giou'] = args.giou_loss_coef
+    weight_dict['loss_dsgl'] = 1.0
     if args.masks:  # always true
         weight_dict['loss_mask'] = args.mask_loss_coef
         weight_dict['loss_dice'] = args.dice_loss_coef
@@ -397,7 +408,7 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes']
+    losses = ['labels', 'boxes', 'dsgl']
     if args.masks:
         losses += ['masks']
     criterion = SetCriterion(
