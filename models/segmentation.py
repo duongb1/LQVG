@@ -420,14 +420,21 @@ class VisionLanguageFusionModule(nn.Module):
     def forward(self, tgt, memory,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=None,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+                query_pos: Optional[Tensor] = None,
+                need_weights: bool = False,
+                average_attn_weights: bool = True):
+        tgt2, attn_weights = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=None,
+            key_padding_mask=memory_key_padding_mask,
+            need_weights=need_weights,
+            average_attn_weights=average_attn_weights,
+        )
         tgt = tgt * tgt2
-        # tgt = tgt + tgt2
-        # tgt = self.norm(tgt + self.dropout(tgt2))
+        if need_weights:
+            return tgt, attn_weights
         return tgt
 
 

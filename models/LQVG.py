@@ -11,6 +11,7 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        nested_tensor_from_videos_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized, inverse_sigmoid)
+from util.losses import attention_alignment_loss
 
 from .position_encoding import PositionEmbeddingSine1D
 from .backbone import build_backbone
@@ -38,7 +39,7 @@ class LQVG(nn.Module):
 
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
                  num_frames, aux_loss=False, with_box_refine=False, two_stage=False,
-                 freeze_text_encoder=False):
+                 freeze_text_encoder=False, lambda_aal=0.0):
 
         super().__init__()
         self.num_queries = num_queries
@@ -125,6 +126,7 @@ class LQVG(nn.Module):
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
         self.dsgl = DSGL(embed_dim=hidden_dim, heatmap_size=32)
+        self.lambda_aal = lambda_aal
         self.id_mscma = ID_MSCMA(d_model=hidden_dim, n_heads=8, n_levels=4, n_points=4, n_layers=2, weight_sharing=True)
         self.film2 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
         self.film3 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
@@ -152,6 +154,18 @@ class LQVG(nn.Module):
             for i, p in enumerate(pos):
                 pos[i] = p.index_select(0, valid_indices)
             samples.mask = samples.mask.index_select(0, valid_indices)
+            for target in targets:
+                if 'valid_indices' not in target:
+                    continue
+                vidx = target['valid_indices']
+                if isinstance(vidx, torch.Tensor):
+                    vidx = int(vidx.item())
+                else:
+                    vidx = int(vidx)
+                if 'boxes' in target:
+                    target['boxes'] = target['boxes'][vidx:vidx + 1]
+                if 'valid' in target:
+                    target['valid'] = target['valid'][vidx:vidx + 1]
             # t: num_frames -> 1
             t = 1
 
@@ -164,9 +178,15 @@ class LQVG(nn.Module):
 
         text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
         text_word_features, text_word_masks = text_features.decompose()
+        text_word_masks = text_word_masks.to(text_word_features.device)
 
         text_word_features = text_word_features.permute(1, 0, 2)  # [length, batch_size, c]
         text_word_initial_features = text_word_features
+
+        attn_last = None
+        mscma_token_mask = None
+        mscma_hw = None
+        attn_frames = t
 
         # Follow Deformable-DETR, we use the last three stages outputs from backbone
         for l, (feat, pos_l) in enumerate(zip(features[-3:], pos[-3:])):
@@ -176,13 +196,20 @@ class LQVG(nn.Module):
 
             # vision language early-fusion
             src_proj_l = rearrange(src_proj_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
-            mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
+            mask_tokens = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
             pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
-            text_word_features = self.fusion_module_text(tgt=text_word_features,
-                                                         memory=src_proj_l,
-                                                         memory_key_padding_mask=mask,
-                                                         pos=pos_l,
-                                                         query_pos=None)
+            text_word_features, attn_weights = self.fusion_module_text(
+                tgt=text_word_features,
+                memory=src_proj_l,
+                memory_key_padding_mask=mask_tokens,
+                pos=pos_l,
+                query_pos=None,
+                need_weights=True,
+            )
+            attn_last = attn_weights
+            mscma_token_mask = mask_tokens
+            mscma_hw = (h, w)
+            attn_frames = t
 
             src_proj_l = self.fusion_module(tgt=src_proj_l,
                                             memory=text_word_initial_features,
@@ -190,7 +217,7 @@ class LQVG(nn.Module):
                                             pos=text_pos,
                                             query_pos=None)
             src_proj_l = rearrange(src_proj_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
-            mask = rearrange(mask, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
+            mask = rearrange(mask_tokens, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
             pos_l = rearrange(pos_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
 
             srcs.append(src_proj_l)
@@ -212,14 +239,21 @@ class LQVG(nn.Module):
 
                 # vision language early-fusion
                 src = rearrange(src, '(b t) c h w -> (t h w) b c', b=b, t=t)
-                mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
+                mask_tokens = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
                 pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
 
-                text_word_features = self.fusion_module_text(tgt=text_word_features,
-                                                             memory=src,
-                                                             memory_key_padding_mask=mask,
-                                                             pos=pos_l,
-                                                             query_pos=None)
+                text_word_features, attn_weights = self.fusion_module_text(
+                    tgt=text_word_features,
+                    memory=src,
+                    memory_key_padding_mask=mask_tokens,
+                    pos=pos_l,
+                    query_pos=None,
+                    need_weights=True,
+                )
+                attn_last = attn_weights
+                mscma_token_mask = mask_tokens
+                mscma_hw = (h, w)
+                attn_frames = t
                 src = self.fusion_module(tgt=src,
                                          memory=text_word_initial_features,
                                          memory_key_padding_mask=text_word_masks,
@@ -227,7 +261,7 @@ class LQVG(nn.Module):
                                          query_pos=None
                                          )
                 src = rearrange(src, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
-                mask = rearrange(mask, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
+                mask = rearrange(mask_tokens, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
                 pos_l = rearrange(pos_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
 
                 srcs.append(src)
@@ -326,6 +360,74 @@ class LQVG(nn.Module):
 
         out['pred_heatmap'] = pred_heatmap
         out['pred_iou'] = pred_iou
+
+        if (attn_last is not None and mscma_token_mask is not None and mscma_hw is not None
+                and targets is not None and len(targets) > 0 and self.lambda_aal > 0):
+            device = attn_last.device
+            h_tokens, w_tokens = mscma_hw
+            gt_masks = []
+            for target in targets:
+                target_boxes = target.get('boxes')
+                target_valid = target.get('valid')
+                if target_boxes is None or target_valid is None:
+                    gt_masks.append(torch.zeros(attn_frames * h_tokens * w_tokens, device=device))
+                    continue
+
+                if target_boxes.dim() == 1:
+                    target_boxes = target_boxes.unsqueeze(0)
+                if target_valid.dim() == 0:
+                    target_valid = target_valid.unsqueeze(0)
+
+                if target_boxes.size(0) < attn_frames:
+                    pad_boxes = target_boxes.new_zeros(attn_frames - target_boxes.size(0), target_boxes.size(1))
+                    target_boxes = torch.cat([target_boxes, pad_boxes], dim=0)
+                else:
+                    target_boxes = target_boxes[:attn_frames]
+
+                if target_valid.size(0) < attn_frames:
+                    pad_valid = target_valid.new_zeros(attn_frames - target_valid.size(0))
+                    target_valid = torch.cat([target_valid, pad_valid], dim=0)
+                else:
+                    target_valid = target_valid[:attn_frames]
+
+                frame_masks = []
+                for frame_idx in range(attn_frames):
+                    if target_valid[frame_idx] <= 0:
+                        frame_masks.append(torch.zeros(h_tokens, w_tokens, device=device))
+                        continue
+
+                    cx, cy, bw, bh = target_boxes[frame_idx]
+                    x0 = (cx - bw / 2.0) * w_tokens
+                    x1 = (cx + bw / 2.0) * w_tokens
+                    y0 = (cy - bh / 2.0) * h_tokens
+                    y1 = (cy + bh / 2.0) * h_tokens
+
+                    x0 = int(torch.floor(x0).clamp(min=0, max=w_tokens - 1).item())
+                    y0 = int(torch.floor(y0).clamp(min=0, max=h_tokens - 1).item())
+                    x1 = int(torch.ceil(x1).clamp(min=0, max=w_tokens).item())
+                    y1 = int(torch.ceil(y1).clamp(min=0, max=h_tokens).item())
+                    x1 = max(x1, x0 + 1)
+                    y1 = max(y1, y0 + 1)
+
+                    mask_frame = torch.zeros(h_tokens, w_tokens, device=device)
+                    mask_frame[y0:y1, x0:x1] = 1.0
+                    frame_masks.append(mask_frame)
+
+                frame_masks = torch.stack(frame_masks, dim=0)
+                gt_masks.append(frame_masks.reshape(-1))
+
+            gt_mask_flat = torch.stack(gt_masks, dim=0)
+            valid_token_mask = (~mscma_token_mask).float()
+            gt_mask_flat = gt_mask_flat * valid_token_mask
+
+            text_valid = (~text_word_masks).float()
+            valid_token_count = text_valid.sum(dim=1, keepdim=True).clamp(min=1.0)
+            attn_mean = (attn_last * text_valid.unsqueeze(-1)).sum(dim=1) / valid_token_count
+            attn_mean = attn_mean.clamp(0.0, 1.0)
+            gt_mask_flat = gt_mask_flat.clamp(0.0, 1.0)
+
+            loss_aal = attention_alignment_loss(attn_mean, gt_mask_flat, reduction="mean")
+            out['loss_aal'] = loss_aal * self.lambda_aal
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
@@ -443,7 +545,8 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
-        freeze_text_encoder=args.freeze_text_encoder
+        freeze_text_encoder=args.freeze_text_encoder,
+        lambda_aal=args.lambda_aal
     )
     matcher = build_matcher(args)
     weight_dict = {}
@@ -451,6 +554,7 @@ def build(args):
     weight_dict['loss_bbox'] = args.bbox_loss_coef
     weight_dict['loss_giou'] = args.giou_loss_coef
     weight_dict['loss_dsgl'] = 1.0
+    weight_dict['loss_aal'] = 1.0
     if args.masks:  # always true
         weight_dict['loss_mask'] = args.mask_loss_coef
         weight_dict['loss_dice'] = args.dice_loss_coef
@@ -461,7 +565,7 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'dsgl']
+    losses = ['labels', 'boxes', 'dsgl', 'aal']
     if args.masks:
         losses += ['masks']
     criterion = SetCriterion(
