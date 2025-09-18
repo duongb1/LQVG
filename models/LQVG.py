@@ -123,12 +123,14 @@ class LQVG(nn.Module):
 
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
+
         self.pre_mscma = PreMSCMAFusion(
             d_model=hidden_dim,
             k_prompts=6,
             n_heads=8,
             dropout=0.0,
         )
+
         self.mscma_deform = MSCMADeform(
             d_model=hidden_dim,
             n_heads=8,
@@ -221,6 +223,7 @@ class LQVG(nn.Module):
                 (spatial_shapes_tensor[:, 0] * spatial_shapes_tensor[:, 1]).cumsum(0)[:-1],
             )
         )
+
 
         vis_value, extras_pre = self.pre_mscma(
             vis_tokens=vis_value,
