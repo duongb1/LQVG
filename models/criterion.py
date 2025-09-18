@@ -8,6 +8,7 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 
 from .segmentation import (dice_loss, sigmoid_focal_loss)
+from .id_mscma import attention_alignment_loss
 
 from einops import rearrange
 
@@ -188,6 +189,16 @@ class SetCriterion(nn.Module):
         loss_dsgl = self.lambda_heatmap * heatmap_loss + self.lambda_iou * iou_loss
         return {'loss_dsgl': loss_dsgl}
 
+    def loss_aal(self, outputs, targets, indices, num_boxes):
+        if 'mscma_attn' not in outputs or 'aal_gt_mask' not in outputs:
+            device = next(iter(outputs.values())).device
+            return {'loss_aal': torch.zeros([], device=device)}
+
+        attn = outputs['mscma_attn']
+        gt_mask = outputs['aal_gt_mask']
+        loss = attention_alignment_loss(attn, gt_mask, reduction='mean')
+        return {'loss_aal': loss}
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -205,7 +216,8 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'boxes': self.loss_boxes,
             'masks': self.loss_masks,
-            'dsgl': self.loss_dsgl
+            'dsgl': self.loss_dsgl,
+            'aal': self.loss_aal
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

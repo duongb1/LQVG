@@ -18,6 +18,7 @@ from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
 from .dsgl import DSGL
+from .id_mscma import ID_MSCMA, FiLMLite, attention_alignment_loss
 
 from transformers import BertTokenizer, BertModel, RobertaModel, RobertaTokenizerFast
 
@@ -123,6 +124,17 @@ class LQVG(nn.Module):
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
         self.dsgl = DSGL(embed_dim=hidden_dim, heatmap_size=32)
+        self.id_mscma = ID_MSCMA(
+            d_model=hidden_dim,
+            n_heads=8,
+            n_levels=4,
+            n_points=4,
+            n_layers=2,
+            weight_sharing=True,
+        )
+        self.film2 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
+        self.film3 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
+        self.lambda_aal = 0.05
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -231,6 +243,49 @@ class LQVG(nn.Module):
         text_word_features = rearrange(text_word_features, 'l b c -> b l c')
         text_sentence_features = self.poolout_module(text_word_features)
 
+        feats = []
+        for src in srcs:
+            b_t, c, h, w = src.shape
+            feat_bt = rearrange(src, '(b t) c h w -> b t c h w', b=b, t=t)
+            feat_avg = feat_bt.mean(dim=1)
+            feats.append(feat_avg)
+
+        mscma_txt = text_word_features
+        mscma_vis = None
+        attn_last = None
+        aal_gt_mask = None
+        if feats:
+            t_global = text_sentence_features
+            if len(feats) > 1:
+                feats[1] = self.film2(feats[1], t_global)
+            if len(feats) > 2:
+                feats[2] = self.film3(feats[2], t_global)
+
+            spatial_shapes = torch.as_tensor(
+                [[feat.shape[-2], feat.shape[-1]] for feat in feats],
+                dtype=torch.long,
+                device=feats[0].device,
+            )
+            level_start_index = spatial_shapes.prod(1).cumsum(0)
+            level_start_index = torch.roll(level_start_index, 1, dims=0)
+            level_start_index[0] = 0
+            B, L, _ = text_word_features.shape
+            reference_points = torch.full(
+                (B, L, len(feats), 2), 0.5, device=feats[0].device
+            )
+
+            mscma_txt, mscma_vis, attn_last = self.id_mscma(
+                text_word_features,
+                feats,
+                spatial_shapes,
+                level_start_index,
+                reference_points,
+                vis_tokens=None,
+            )
+
+            if targets is not None and all('masks' in tgt for tgt in targets):
+                aal_gt_mask = self._build_aal_mask(targets, feats, t, feats[0].device)
+
         # Transformer
         query_embeds = self.query_embed.weight  # [num_queries, c]
         text_embed = repeat(text_sentence_features, 'b c -> b t q c', t=t, q=self.num_queries)
@@ -239,6 +294,13 @@ class LQVG(nn.Module):
 
 
         out = {}
+        out['mscma_txt'] = mscma_txt
+        if mscma_vis is not None:
+            out['mscma_vis'] = mscma_vis
+        if attn_last is not None:
+            out['mscma_attn'] = attn_last
+        if aal_gt_mask is not None:
+            out['aal_gt_mask'] = aal_gt_mask
         # prediction
         outputs_classes = []
         outputs_coords = []
@@ -286,6 +348,45 @@ class LQVG(nn.Module):
         # as a dict having both a Tensor and a list.
         return [{"pred_logits": a, "pred_boxes": b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+
+    def _build_aal_mask(self, targets, feats, num_frames, device):
+        spatial_shapes = [(feat.shape[-2], feat.shape[-1]) for feat in feats]
+        total_tokens = sum(h * w for h, w in spatial_shapes)
+        gt_mask = torch.zeros(len(targets), total_tokens, device=device, dtype=feats[0].dtype)
+
+        offset = 0
+        for h, w in spatial_shapes:
+            level_masks = []
+            for target in targets:
+                if 'masks' not in target:
+                    level_masks.append(torch.zeros(h * w, device=device))
+                    continue
+
+                tgt_masks = target['masks']
+                if tgt_masks.dim() == 4:
+                    tgt_masks = tgt_masks[:, 0]
+                tgt_masks = tgt_masks[:num_frames].to(device=device, dtype=torch.float32)
+                if tgt_masks.numel() == 0:
+                    level_masks.append(torch.zeros(h * w, device=device))
+                    continue
+
+                if 'valid' in target:
+                    valid = target['valid'][:tgt_masks.shape[0]].to(device).view(-1, 1, 1)
+                    tgt_masks = tgt_masks[:valid.shape[0]] * valid
+
+                union_mask = tgt_masks.max(dim=0).values if tgt_masks.dim() > 2 else tgt_masks
+                resized = F.interpolate(
+                    union_mask.unsqueeze(0).unsqueeze(0),
+                    size=(h, w),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
+                level_masks.append(resized.flatten())
+
+            gt_mask[:, offset:offset + h * w] = torch.stack(level_masks, dim=0)
+            offset += h * w
+
+        return gt_mask.clamp(0, 1)
 
     def forward_text(self, captions, device):
         if isinstance(captions[0], str):
@@ -398,6 +499,7 @@ def build(args):
     weight_dict['loss_bbox'] = args.bbox_loss_coef
     weight_dict['loss_giou'] = args.giou_loss_coef
     weight_dict['loss_dsgl'] = 1.0
+    weight_dict['loss_aal'] = model.lambda_aal
     if args.masks:  # always true
         weight_dict['loss_mask'] = args.mask_loss_coef
         weight_dict['loss_dice'] = args.dice_loss_coef
@@ -408,7 +510,7 @@ def build(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['labels', 'boxes', 'dsgl']
+    losses = ['labels', 'boxes', 'dsgl', 'aal']
     if args.masks:
         losses += ['masks']
     criterion = SetCriterion(
