@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from models.id_mscma import ID_MSCMA, FiLMLite, attention_alignment_loss
+
 import os
 import math
 from util import box_ops
@@ -123,6 +125,10 @@ class LQVG(nn.Module):
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
         self.dsgl = DSGL(embed_dim=hidden_dim, heatmap_size=32)
+        self.id_mscma = ID_MSCMA(d_model=hidden_dim, n_heads=8, n_levels=4, n_points=4, n_layers=2, weight_sharing=True)
+        self.film2 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
+        self.film3 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
+        self.lambda_aal = 0.05
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -229,6 +235,50 @@ class LQVG(nn.Module):
                 poses.append(pos_l)
 
         text_word_features = rearrange(text_word_features, 'l b c -> b l c')
+        TXT_TOKENS = text_word_features
+        dir_token_lists = []
+        for caption in captions:
+            if isinstance(caption, str):
+                normalized = caption.lower().replace('/', ' ').replace('_', ' ')
+                dir_token_lists.append(normalized.split())
+            else:
+                dir_token_lists.append([])
+        feats = srcs
+        t_global = TXT_TOKENS[:, 0]
+        if t > 1:
+            t_global_vis = t_global.unsqueeze(1).expand(b, t, -1).reshape(b * t, -1)
+        else:
+            t_global_vis = t_global
+        if len(feats) > 1:
+            feats[1] = self.film2(feats[1], t_global_vis)
+        if len(feats) > 2:
+            feats[2] = self.film3(feats[2], t_global_vis)
+
+        spatial_shapes = torch.as_tensor([[f.shape[-2], f.shape[-1]] for f in feats],
+                                         dtype=torch.long, device=feats[0].device)
+        level_start_index = spatial_shapes.prod(1).cumsum(0)
+        level_start_index = torch.roll(level_start_index, 1, 0)
+        level_start_index[0] = 0
+        txt_tokens_mscma = TXT_TOKENS
+        dir_tokens = dir_token_lists
+        if t > 1:
+            txt_tokens_mscma = TXT_TOKENS.unsqueeze(1).expand(b, t, -1, -1).reshape(b * t, TXT_TOKENS.shape[1], TXT_TOKENS.shape[2])
+            dir_tokens = [tokens.copy() for tokens in dir_token_lists for _ in range(t)]
+        reference_points = torch.full((txt_tokens_mscma.shape[0], txt_tokens_mscma.shape[1], len(feats), 2), 0.5, device=feats[0].device)
+        if len(dir_tokens) != txt_tokens_mscma.shape[0]:
+            dir_tokens = None
+        t2, v2, attn_last = self.id_mscma(
+            txt_tokens_mscma, feats, spatial_shapes, level_start_index, reference_points,
+            vis_tokens=None, dir_tokens=dir_tokens, anneal=(0.3, 0.1)
+        )
+        Ns = [(h * w).item() for h, w in spatial_shapes]
+        splits = torch.split(v2, Ns, dim=1)
+        refined_feats = [s.transpose(1, 2).reshape(txt_tokens_mscma.shape[0], self.hidden_dim, h.item(), w.item()) for s, (h, w) in zip(splits, spatial_shapes)]
+        srcs = refined_feats
+        if t > 1:
+            text_word_features = t2.view(b, t, TXT_TOKENS.shape[1], TXT_TOKENS.shape[2]).mean(dim=1)
+        else:
+            text_word_features = t2
         text_sentence_features = self.poolout_module(text_word_features)
 
         # Transformer
@@ -239,6 +289,9 @@ class LQVG(nn.Module):
 
 
         out = {}
+        out['mscma_txt'] = t2
+        out['mscma_vis'] = v2
+        out['mscma_attn'] = attn_last
         # prediction
         outputs_classes = []
         outputs_coords = []
