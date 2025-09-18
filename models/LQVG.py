@@ -254,6 +254,8 @@ class LQVG(nn.Module):
         mscma_vis = None
         attn_last = None
         aal_gt_mask = None
+        spatial_shapes_tensor = None
+
         if feats:
             t_global = text_sentence_features
             if len(feats) > 1:
@@ -283,7 +285,9 @@ class LQVG(nn.Module):
                 vis_tokens=None,
             )
 
-            if targets is not None and all('masks' in tgt for tgt in targets):
+            spatial_shapes_tensor = spatial_shapes
+
+            if targets is not None:
                 aal_gt_mask = self._build_aal_mask(targets, feats, t, feats[0].device)
 
         # Transformer
@@ -299,6 +303,8 @@ class LQVG(nn.Module):
             out['mscma_vis'] = mscma_vis
         if attn_last is not None:
             out['mscma_attn'] = attn_last
+        if spatial_shapes_tensor is not None:
+            out['mscma_shapes'] = spatial_shapes_tensor
         if aal_gt_mask is not None:
             out['aal_gt_mask'] = aal_gt_mask
         # prediction

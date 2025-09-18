@@ -190,14 +190,77 @@ class SetCriterion(nn.Module):
         return {'loss_dsgl': loss_dsgl}
 
     def loss_aal(self, outputs, targets, indices, num_boxes):
-        if 'mscma_attn' not in outputs or 'aal_gt_mask' not in outputs:
+
+        attn = outputs.get('mscma_attn')
+        if attn is None:
             device = next(iter(outputs.values())).device
             return {'loss_aal': torch.zeros([], device=device)}
 
-        attn = outputs['mscma_attn']
-        gt_mask = outputs['aal_gt_mask']
+        if attn.dim() == 4:
+            attn = attn.mean(dim=1)
+        if attn.dim() != 3:
+            raise ValueError('Expected attention weights with shape [B, N, L]')
+
+        gt_mask = outputs.get('aal_gt_mask')
+        if gt_mask is None:
+            spatial_shapes = outputs.get('mscma_shapes')
+            if spatial_shapes is None:
+                device = attn.device
+                return {'loss_aal': torch.zeros([], device=device)}
+            gt_mask = self._build_aal_mask_from_targets(targets, spatial_shapes, attn.device)
+        else:
+            gt_mask = gt_mask.to(attn.device)
+
         loss = attention_alignment_loss(attn, gt_mask, reduction='mean')
         return {'loss_aal': loss}
+
+    def _build_aal_mask_from_targets(self, targets, spatial_shapes, device):
+        if isinstance(spatial_shapes, torch.Tensor):
+            shapes = spatial_shapes.tolist()
+        else:
+            shapes = spatial_shapes
+
+        total_tokens = sum(h * w for h, w in shapes)
+        gt_mask = torch.zeros(len(targets), total_tokens, device=device)
+
+        offset = 0
+        for h, w in shapes:
+            level_masks = []
+            for target in targets:
+                if 'masks' not in target or target['masks'] is None:
+                    level_masks.append(torch.zeros(h * w, device=device))
+                    continue
+
+                tgt_masks = target['masks']
+                if tgt_masks.dim() == 4:
+                    tgt_masks = tgt_masks[:, 0]
+                tgt_masks = tgt_masks.to(device=device, dtype=torch.float32)
+                if tgt_masks.numel() == 0:
+                    level_masks.append(torch.zeros(h * w, device=device))
+                    continue
+
+                valid = target.get('valid')
+                if valid is not None:
+                    valid = valid.to(device=device, dtype=torch.float32)
+                    if valid.dim() == 1:
+                        valid = valid.view(-1, 1, 1)
+                    tgt_masks = tgt_masks[:valid.shape[0]] * valid[:tgt_masks.shape[0]]
+
+                union_mask = tgt_masks.max(dim=0).values if tgt_masks.dim() > 2 else tgt_masks
+                resized = F.interpolate(
+                    union_mask.unsqueeze(0).unsqueeze(0),
+                    size=(h, w),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
+                level_masks.append(resized.flatten())
+
+            if level_masks:
+                gt_mask[:, offset:offset + h * w] = torch.stack(level_masks, dim=0)
+            offset += h * w
+
+        return gt_mask.clamp(0, 1)
+
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
