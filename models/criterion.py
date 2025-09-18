@@ -190,6 +190,7 @@ class SetCriterion(nn.Module):
         return {'loss_dsgl': loss_dsgl}
 
     def loss_aal(self, outputs, targets, indices, num_boxes):
+
         attn = outputs.get('mscma_attn')
         if attn is None:
             device = next(iter(outputs.values())).device
@@ -259,6 +260,7 @@ class SetCriterion(nn.Module):
             offset += h * w
 
         return gt_mask.clamp(0, 1)
+
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices

@@ -255,6 +255,7 @@ class LQVG(nn.Module):
         attn_last = None
         aal_gt_mask = None
         spatial_shapes_tensor = None
+
         if feats:
             t_global = text_sentence_features
             if len(feats) > 1:

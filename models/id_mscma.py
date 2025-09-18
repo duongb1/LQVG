@@ -60,8 +60,10 @@ class MSDeformAttnAdapter(nn.Module):
         q_proj = self.q_proj(q)
         value = torch.cat([feat.flatten(2).transpose(1, 2) for feat in feats], dim=1)
         out = self.attn(q_proj, reference_points, value, spatial_shapes, level_start_index, None)
+
         if isinstance(out, tuple):
             out = out[0]
+
         return self.out_proj(out)
 
 
@@ -96,6 +98,7 @@ class BiDirCMLayer(nn.Module):
 
         vis_query = vis_tokens + (vis_pos if vis_pos is not None else 0)
         vis_key = txt_res + (txt_pos if txt_pos is not None else 0)
+
         vis_out, attn_weights = self.vli_attn(
             vis_query,
             vis_key,
@@ -103,6 +106,7 @@ class BiDirCMLayer(nn.Module):
             need_weights=True,
             average_attn_weights=True,
         )
+
         vis_res = self.vli_norm1(vis_tokens + vis_out)
         vis_res = self.vli_norm2(vis_res + self.vli_ffn(vis_res))
         return txt_res, vis_res, attn_weights
