@@ -96,6 +96,8 @@ def get_args_parser():
     parser.add_argument('--cls_loss_coef', default=2, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--lambda_aal', default=0.1, type=float,
+                        help='Weight for the attention alignment loss')
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
     parser.add_argument('--focal_alpha', default=0.25, type=float)
