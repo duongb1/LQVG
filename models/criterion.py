@@ -8,6 +8,7 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 
 from .segmentation import (dice_loss, sigmoid_focal_loss)
+from .id_mscma import attention_alignment_loss
 
 from einops import rearrange
 
@@ -188,6 +189,77 @@ class SetCriterion(nn.Module):
         loss_dsgl = self.lambda_heatmap * heatmap_loss + self.lambda_iou * iou_loss
         return {'loss_dsgl': loss_dsgl}
 
+    def loss_aal(self, outputs, targets, indices, num_boxes):
+        attn = outputs.get('mscma_attn')
+        if attn is None:
+            device = next(iter(outputs.values())).device
+            return {'loss_aal': torch.zeros([], device=device)}
+
+        if attn.dim() == 4:
+            attn = attn.mean(dim=1)
+        if attn.dim() != 3:
+            raise ValueError('Expected attention weights with shape [B, N, L]')
+
+        gt_mask = outputs.get('aal_gt_mask')
+        if gt_mask is None:
+            spatial_shapes = outputs.get('mscma_shapes')
+            if spatial_shapes is None:
+                device = attn.device
+                return {'loss_aal': torch.zeros([], device=device)}
+            gt_mask = self._build_aal_mask_from_targets(targets, spatial_shapes, attn.device)
+        else:
+            gt_mask = gt_mask.to(attn.device)
+
+        loss = attention_alignment_loss(attn, gt_mask, reduction='mean')
+        return {'loss_aal': loss}
+
+    def _build_aal_mask_from_targets(self, targets, spatial_shapes, device):
+        if isinstance(spatial_shapes, torch.Tensor):
+            shapes = spatial_shapes.tolist()
+        else:
+            shapes = spatial_shapes
+
+        total_tokens = sum(h * w for h, w in shapes)
+        gt_mask = torch.zeros(len(targets), total_tokens, device=device)
+
+        offset = 0
+        for h, w in shapes:
+            level_masks = []
+            for target in targets:
+                if 'masks' not in target or target['masks'] is None:
+                    level_masks.append(torch.zeros(h * w, device=device))
+                    continue
+
+                tgt_masks = target['masks']
+                if tgt_masks.dim() == 4:
+                    tgt_masks = tgt_masks[:, 0]
+                tgt_masks = tgt_masks.to(device=device, dtype=torch.float32)
+                if tgt_masks.numel() == 0:
+                    level_masks.append(torch.zeros(h * w, device=device))
+                    continue
+
+                valid = target.get('valid')
+                if valid is not None:
+                    valid = valid.to(device=device, dtype=torch.float32)
+                    if valid.dim() == 1:
+                        valid = valid.view(-1, 1, 1)
+                    tgt_masks = tgt_masks[:valid.shape[0]] * valid[:tgt_masks.shape[0]]
+
+                union_mask = tgt_masks.max(dim=0).values if tgt_masks.dim() > 2 else tgt_masks
+                resized = F.interpolate(
+                    union_mask.unsqueeze(0).unsqueeze(0),
+                    size=(h, w),
+                    mode='bilinear',
+                    align_corners=False,
+                ).squeeze(0).squeeze(0)
+                level_masks.append(resized.flatten())
+
+            if level_masks:
+                gt_mask[:, offset:offset + h * w] = torch.stack(level_masks, dim=0)
+            offset += h * w
+
+        return gt_mask.clamp(0, 1)
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -205,7 +277,8 @@ class SetCriterion(nn.Module):
             'labels': self.loss_labels,
             'boxes': self.loss_boxes,
             'masks': self.loss_masks,
-            'dsgl': self.loss_dsgl
+            'dsgl': self.loss_dsgl,
+            'aal': self.loss_aal
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
