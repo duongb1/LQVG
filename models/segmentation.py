@@ -239,7 +239,7 @@ class CrossModalFPNDecoder(nn.Module):
         return y   # [b*t, c, h, w], the spatial stride is 4x
 
     def forward(self, features, text_features, pos, memory, nf):
-        """The forward function receives the vision and language features, 
+        """The forward function receives the vision and language features,
             and outputs the mask features with the spatial stride of 4x.
 
         Args:
@@ -257,6 +257,87 @@ class CrossModalFPNDecoder(nn.Module):
         """
         y = self.forward_features(features, text_features, pos, memory, nf)
         return self.mask_features(y)
+
+    def forward_with_priors(self, features, text_features, pos, memory, nf):
+        """Forward pass that also returns attention priors per FPN level."""
+
+        attn_priors = []
+        text_pos = self.text_pos(text_features).permute(2, 0, 1)
+        text_features, text_masks = text_features.decompose()
+        text_features = text_features.permute(1, 0, 2)
+
+        for idx, (mem, f, pos_l) in enumerate(zip(memory[::-1], features[1:][::-1], pos[1:][::-1])):
+            lateral_conv = self.lateral_convs[idx]
+            output_conv = self.output_convs[idx]
+            cross_attn = self.cross_attns[idx]
+
+            _, x_mask = f.decompose()
+            n, c, h, w = pos_l.shape
+            b = n // nf
+            t = nf
+
+            vision_features = lateral_conv(mem)
+            vision_features = rearrange(vision_features, '(b t) c h w -> (t h w) b c', b=b, t=t)
+            vision_pos = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
+            vision_masks = rearrange(x_mask, '(b t) h w -> b (t h w)', b=b, t=t)
+
+            cur_fpn, attn_w = cross_attn(
+                tgt=vision_features,
+                memory=text_features,
+                t=t,
+                h=h,
+                w=w,
+                tgt_key_padding_mask=vision_masks,
+                memory_key_padding_mask=text_masks,
+                pos=text_pos,
+                query_pos=vision_pos,
+                return_attn=True,
+            )
+            cur_fpn = rearrange(cur_fpn, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
+            prior = attn_w.mean(dim=1).mean(dim=-1).reshape(b, t, h, w)
+            attn_priors.append(prior)
+
+            if idx == 0:
+                y = output_conv(cur_fpn)
+            else:
+                y = cur_fpn + F.interpolate(y, size=cur_fpn.shape[-2:], mode="nearest")
+                y = output_conv(y)
+
+        lateral_conv = self.lateral_convs[-1]
+        output_conv = self.output_convs[-1]
+        cross_attn = self.cross_attns[-1]
+
+        x, x_mask = features[0].decompose()
+        pos_l = pos[0]
+        n, c, h, w = pos_l.shape
+        b = n // nf
+        t = nf
+
+        vision_features = lateral_conv(x)
+        vision_features = rearrange(vision_features, '(b t) c h w -> (t h w) b c', b=b, t=t)
+        vision_pos = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
+        vision_masks = rearrange(x_mask, '(b t) h w -> b (t h w)', b=b, t=t)
+
+        cur_fpn, attn_w = cross_attn(
+            tgt=vision_features,
+            memory=text_features,
+            t=t,
+            h=h,
+            w=w,
+            tgt_key_padding_mask=vision_masks,
+            memory_key_padding_mask=text_masks,
+            pos=text_pos,
+            query_pos=vision_pos,
+            return_attn=True,
+        )
+        cur_fpn = rearrange(cur_fpn, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
+        prior = attn_w.mean(dim=1).mean(dim=-1).reshape(b, t, h, w)
+        attn_priors.append(prior)
+
+        y = cur_fpn + F.interpolate(y, size=cur_fpn.shape[-2:], mode="nearest")
+        y = output_conv(y)
+        mask_feats = self.mask_features(y)
+        return mask_feats, attn_priors
 
 
 class VisionLanguageBlock(nn.Module):
@@ -290,7 +371,8 @@ class VisionLanguageBlock(nn.Module):
                      tgt_key_padding_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
+                     query_pos: Optional[Tensor] = None,
+                     return_attn: bool = False):
         b = tgt.size(1)
         # self attn
         q = k = self.with_pos_embed(tgt, query_pos)
@@ -326,10 +408,14 @@ class VisionLanguageBlock(nn.Module):
         tgt = self.norm1(tgt)
 
         # cross attn
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=None,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+        attn_out, attn_w = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+                                               key=self.with_pos_embed(memory, pos),
+                                               value=memory,
+                                               attn_mask=None,
+                                               key_padding_mask=memory_key_padding_mask,
+                                               need_weights=True,
+                                               average_attn_weights=False)
+        tgt2 = attn_out
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
 
@@ -337,13 +423,16 @@ class VisionLanguageBlock(nn.Module):
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+        if return_attn:
+            return tgt, attn_w
         return tgt
 
     def forward_pre(self, tgt, memory, t, h, w,
                     tgt_key_padding_mask: Optional[Tensor] = None,
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
+                    query_pos: Optional[Tensor] = None,
+                    return_attn: bool = False):
         b = tgt.size(1)
         # self attn
         tgt2 = self.norm1(tgt)
@@ -380,30 +469,36 @@ class VisionLanguageBlock(nn.Module):
 
         # cross attn
         tgt2 = self.norm2(tgt)
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=None,
-                                   key_padding_mask=memory_key_padding_mask)[0]
-        tgt = tgt + self.dropout2(tgt2)
+        attn_out, attn_w = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
+                                               key=self.with_pos_embed(memory, pos),
+                                               value=memory,
+                                               attn_mask=None,
+                                               key_padding_mask=memory_key_padding_mask,
+                                               need_weights=True,
+                                               average_attn_weights=False)
+        tgt = tgt + self.dropout2(attn_out)
 
         # ffn
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
         tgt = tgt + self.dropout3(tgt2)
+        if return_attn:
+            return tgt, attn_w
         return tgt
 
     def forward(self, tgt, memory, t, h, w,
                 tgt_key_padding_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_pos: Optional[Tensor] = None,
+                return_attn: bool = False):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, t, h, w,
-                                    tgt_key_padding_mask, memory_key_padding_mask, 
-                                    pos, query_pos)
+                                    tgt_key_padding_mask, memory_key_padding_mask,
+                                    pos, query_pos, return_attn)
         return self.forward_post(tgt, memory, t, h, w,
-                                 tgt_key_padding_mask, memory_key_padding_mask, 
-                                 pos, query_pos)
+                                 tgt_key_padding_mask, memory_key_padding_mask,
+                                 pos, query_pos, return_attn)
 
 
 

@@ -14,6 +14,8 @@ from .position_encoding import PositionEmbeddingSine1D
 from .backbone import build_backbone
 from .deformable_transformer import build_deforamble_transformer
 from .segmentation import VisionLanguageFusionModule
+from .modules.mscma_deform import MSCMADeform
+from .modules.pre_mscma_block import PreMSCMAFusion
 from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
@@ -121,6 +123,20 @@ class LQVG(nn.Module):
 
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
+        self.pre_mscma = PreMSCMAFusion(
+            d_model=hidden_dim,
+            k_prompts=6,
+            n_heads=8,
+            dropout=0.0,
+        )
+        self.mscma_deform = MSCMADeform(
+            d_model=hidden_dim,
+            n_heads=8,
+            n_levels=self.num_feature_levels,
+            n_points=4,
+            num_layers=2,
+            dropout=0.1,
+        )
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -154,36 +170,12 @@ class LQVG(nn.Module):
         masks = []
         poses = []
 
-        text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
         text_word_features, text_word_masks = text_features.decompose()
-
-        text_word_features = text_word_features.permute(1, 0, 2)  # [length, batch_size, c]
-        text_word_initial_features = text_word_features
 
         # Follow Deformable-DETR, we use the last three stages outputs from backbone
         for l, (feat, pos_l) in enumerate(zip(features[-3:], pos[-3:])):
             src, mask = feat.decompose()
             src_proj_l = self.input_proj[l](src)
-            n, c, h, w = src_proj_l.shape
-
-            # vision language early-fusion
-            src_proj_l = rearrange(src_proj_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
-            mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
-            pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
-            text_word_features = self.fusion_module_text(tgt=text_word_features,
-                                                         memory=src_proj_l,
-                                                         memory_key_padding_mask=mask,
-                                                         pos=pos_l,
-                                                         query_pos=None)
-
-            src_proj_l = self.fusion_module(tgt=src_proj_l,
-                                            memory=text_word_initial_features,
-                                            memory_key_padding_mask=text_word_masks,
-                                            pos=text_pos,
-                                            query_pos=None)
-            src_proj_l = rearrange(src_proj_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
-            mask = rearrange(mask, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
-            pos_l = rearrange(pos_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
 
             srcs.append(src_proj_l)
             masks.append(mask)
@@ -200,34 +192,63 @@ class LQVG(nn.Module):
                 m = samples.mask
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
-                n, c, h, w = src.shape
-
-                # vision language early-fusion
-                src = rearrange(src, '(b t) c h w -> (t h w) b c', b=b, t=t)
-                mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
-                pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
-
-                text_word_features = self.fusion_module_text(tgt=text_word_features,
-                                                             memory=src,
-                                                             memory_key_padding_mask=mask,
-                                                             pos=pos_l,
-                                                             query_pos=None)
-                src = self.fusion_module(tgt=src,
-                                         memory=text_word_initial_features,
-                                         memory_key_padding_mask=text_word_masks,
-                                         pos=text_pos,
-                                         query_pos=None
-                                         )
-                src = rearrange(src, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
-                mask = rearrange(mask, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
-                pos_l = rearrange(pos_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
 
                 srcs.append(src)
                 masks.append(mask)
                 poses.append(pos_l)
 
-        text_word_features = rearrange(text_word_features, 'l b c -> b l c')
-        text_sentence_features = self.poolout_module(text_word_features)
+        BT = srcs[0].shape[0]
+        d = srcs[0].shape[1]
+        spatial_shapes = []
+        flat_vis = []
+        flat_masks = []
+        for s, m in zip(srcs, masks):
+            _, _, H, W = s.shape
+            spatial_shapes.append([H, W])
+            flat_vis.append(s.flatten(2).transpose(1, 2))
+            flat_masks.append(m.flatten(1))
+        vis_value = torch.cat(flat_vis, dim=1)
+        vis_key_padding_mask = torch.cat(flat_masks, dim=1) if flat_masks and flat_masks[0] is not None else None
+
+        text_word_masks = text_word_masks.to(vis_value.device)
+        text_tokens_bt = repeat(text_word_features, 'b l c -> (b t) l c', t=t)
+        text_padding_bt = repeat(text_word_masks, 'b l -> (b t) l', t=t)
+
+        spatial_shapes_tensor = torch.as_tensor(spatial_shapes, dtype=torch.long, device=vis_value.device)
+        level_start_index = torch.cat(
+            (
+                spatial_shapes_tensor.new_zeros((1,)),
+                (spatial_shapes_tensor[:, 0] * spatial_shapes_tensor[:, 1]).cumsum(0)[:-1],
+            )
+        )
+
+        vis_value, extras_pre = self.pre_mscma(
+            vis_tokens=vis_value,
+            text_tokens=text_tokens_bt,
+            text_padding_mask=text_padding_bt,
+        )
+
+        vis_tokens_en, text_tokens_en = self.mscma_deform(
+            vis_tokens=vis_value,
+            text_tokens=text_tokens_bt,
+            vis_value=vis_value,
+            spatial_shapes=spatial_shapes_tensor,
+            level_start_index=level_start_index,
+            text_padding_mask=text_padding_bt,
+            vis_key_padding_mask=vis_key_padding_mask,
+        )
+
+        new_srcs = []
+        offset = 0
+        for (H, W) in spatial_shapes:
+            num = H * W
+            part = vis_tokens_en[:, offset:offset + num, :].transpose(1, 2).reshape(BT, d, H, W)
+            new_srcs.append(part)
+            offset += num
+        srcs = new_srcs
+
+        text_tokens_en_B = rearrange(text_tokens_en, '(b tt) l c -> b tt l c', b=b, tt=t).mean(1)
+        text_sentence_features = self.poolout_module(text_tokens_en_B)
 
         # Transformer
         query_embeds = self.query_embed.weight  # [num_queries, c]
