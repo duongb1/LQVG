@@ -60,6 +60,10 @@ class MSDeformAttnAdapter(nn.Module):
         q_proj = self.q_proj(q)
         value = torch.cat([feat.flatten(2).transpose(1, 2) for feat in feats], dim=1)
         out = self.attn(q_proj, reference_points, value, spatial_shapes, level_start_index, None)
+
+        if isinstance(out, tuple):
+            out = out[0]
+
         return self.out_proj(out)
 
 
