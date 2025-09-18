@@ -8,6 +8,7 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 
 from .segmentation import (dice_loss, sigmoid_focal_loss)
+
 from einops import rearrange
 
 class SetCriterion(nn.Module):
@@ -188,15 +189,18 @@ class SetCriterion(nn.Module):
         return {'loss_dsgl': loss_dsgl}
 
     def loss_aal(self, outputs, targets, indices, num_boxes):
+
         logits = outputs.get('aal_logits')
         if logits is None:
             device = next(iter(outputs.values())).device
             return {'loss_aal': torch.zeros([], device=device)}
 
+
         gt_mask = outputs.get('aal_gt_mask')
         if gt_mask is None:
             spatial_shapes = outputs.get('mscma_shapes')
             if spatial_shapes is None:
+
                 device = logits.device
                 return {'loss_aal': torch.zeros([], device=device)}
             gt_mask = self._build_aal_mask_from_targets(targets, spatial_shapes, logits.device)
@@ -217,6 +221,7 @@ class SetCriterion(nn.Module):
             pos_weight=pos_weight,
             reduction='mean',
         )
+
         return {'loss_aal': loss}
 
     def _build_aal_mask_from_targets(self, targets, spatial_shapes, device):
@@ -265,6 +270,7 @@ class SetCriterion(nn.Module):
             offset += h * w
 
         return gt_mask.clamp(0, 1)
+
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices

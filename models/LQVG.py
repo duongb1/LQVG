@@ -18,7 +18,9 @@ from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
 from .dsgl import DSGL
+
 from .id_mscma import ID_MSCMA, FiLMLite
+
 
 from transformers import BertTokenizer, BertModel, RobertaModel, RobertaTokenizerFast
 
@@ -134,9 +136,11 @@ class LQVG(nn.Module):
         )
         self.film2 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
         self.film3 = FiLMLite(d_text=hidden_dim, c_vis=hidden_dim, init_alpha=0.1)
+
         self.aal_proj_txt = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.aal_proj_vis = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.lambda_aal = getattr(self, 'lambda_aal', 0.1)
+
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -258,6 +262,7 @@ class LQVG(nn.Module):
         aal_gt_mask = None
         spatial_shapes_tensor = None
         aal_logits = None
+
         if feats:
             t_global = text_sentence_features
             if len(feats) > 1:
@@ -289,6 +294,7 @@ class LQVG(nn.Module):
 
             spatial_shapes_tensor = spatial_shapes
 
+
             use_cls = getattr(self, 'aal_use_cls', True)
             txt_global = mscma_txt[:, 0] if use_cls else mscma_txt.mean(dim=1)
             txt_proj = self.aal_proj_txt(txt_global)
@@ -317,6 +323,7 @@ class LQVG(nn.Module):
             out['aal_gt_mask'] = aal_gt_mask
         if aal_logits is not None:
             out['aal_logits'] = aal_logits
+
         # prediction
         outputs_classes = []
         outputs_coords = []
