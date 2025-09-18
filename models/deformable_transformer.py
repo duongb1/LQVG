@@ -192,7 +192,15 @@ class DeformableTransformer(nn.Module):
         else:
             b, t, q, c = tgt.shape
             tgt = rearrange(tgt, 'b t q c -> (b t) q c')
-            query_embed = query_embed.unsqueeze(0).expand(b*t, -1, -1)      # [batch_size*time, num_queries_per_frame, c]
+            if query_embed.dim() == 2:
+                query_embed = query_embed.unsqueeze(0).expand(b * t, -1, -1)
+            elif query_embed.dim() == 3:
+                if query_embed.shape[0] != b * t:
+                    raise ValueError(
+                        "query_embed with dim=3 must have shape [B*T, num_queries, C]"
+                    )
+            else:
+                raise ValueError("query_embed must be 2-D or 3-D tensor")
             reference_points = self.reference_points(query_embed).sigmoid() # [batch_size*time, num_queries_per_frame, 2]
             init_reference_out = reference_points
 

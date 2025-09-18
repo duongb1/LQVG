@@ -18,6 +18,7 @@ from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
 from .dsgl import DSGL
+from .id_mscma import ID_MSCMA
 
 from transformers import BertTokenizer, BertModel, RobertaModel, RobertaTokenizerFast
 
@@ -123,6 +124,7 @@ class LQVG(nn.Module):
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
         self.dsgl = DSGL(embed_dim=hidden_dim, heatmap_size=32)
+        self.id_mscma = ID_MSCMA(hidden_dim=hidden_dim, num_heads=transformer.nhead)
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -136,6 +138,15 @@ class LQVG(nn.Module):
 
         b = len(captions)
         t = pos[0].shape[0] // b
+
+        direction_token_lists = []
+        for caption in captions:
+            if isinstance(caption, str):
+                direction_token_lists.append([
+                    token.strip(".,!?\"'()[]{}") for token in caption.lower().split()
+                ])
+            else:
+                direction_token_lists.append([])
 
         if 'valid_indices' in targets[0]:
             valid_indices = torch.tensor([i * t + target['valid_indices'] for i, target in enumerate(targets)]).to(
@@ -231,8 +242,26 @@ class LQVG(nn.Module):
         text_word_features = rearrange(text_word_features, 'l b c -> b l c')
         text_sentence_features = self.poolout_module(text_word_features)
 
+        direction_outputs = self.id_mscma(text_sentence_features, direction_token_lists)
+        text_sentence_features = direction_outputs["refined_features"]
+        dir_offset = direction_outputs["dir_offset"]
+        direction_mask = direction_outputs["mask"].bool()
+        attn_bias = direction_outputs["attn_bias"]
+
+        if direction_mask.any():
+            # Non-empty direction cues must yield offsets produced by
+            # BiDirCMLayer._apply_dir_offset; otherwise the prior would not reach
+            # the attention stack as intended.
+            assert dir_offset[direction_mask].abs().sum() > 0, \
+                "Direction-aware offsets should not vanish when cues are present."
+
         # Transformer
-        query_embeds = self.query_embed.weight  # [num_queries, c]
+        base_query_embed = self.query_embed.weight.unsqueeze(0).expand(b * t, -1, -1)
+        direction_query_bias = dir_offset.unsqueeze(1).unsqueeze(1).expand(b, t, self.num_queries, -1)
+        attn_scale = torch.tanh(attn_bias.mean(dim=1, keepdim=True)).unsqueeze(-1)
+        direction_query_bias = direction_query_bias * attn_scale.unsqueeze(1)
+        direction_query_bias = direction_query_bias.reshape(b * t, self.num_queries, -1)
+        query_embeds = base_query_embed + direction_query_bias
         text_embed = repeat(text_sentence_features, 'b c -> b t q c', t=t, q=self.num_queries)
         hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, inter_samples = \
             self.transformer(srcs, text_embed, masks, poses, query_embeds)
