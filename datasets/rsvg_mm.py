@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 import torch.utils.data as data
 import random
 import torch
+from pathlib import Path  # CHANGED: needed for path handling
 
 
 class RSVGDataset(data.Dataset):
@@ -28,9 +29,9 @@ class RSVGDataset(data.Dataset):
         self.split = split
         self.testmode = testmode
 
-        # file = open('data/rsvg_mm/' + 'rsvg_mm_train_v11.txt', "r").readlines()
-        # file = open('data/rsvg_mm/' + 'rsvg_mm_' + split + '.txt', "r").readlines()
-        file = open('data/rsvg_mm/' + 'rsvg_mm_' + split + '_v2.txt', "r").readlines()
+        root = Path(self.images_path).parent
+        file = open(str(root / f"rsvg_hr_{split}.txt"), "r", encoding="utf-8").readlines()
+
         Index = [index.strip('\n') for index in file]
         for anno in Index:
             anno_list = anno.split(',')
@@ -125,8 +126,6 @@ def make_coco_transforms(image_set, cautious):
 
     raise ValueError(f"unknown {image_set}")
 
-from pathlib import Path
-
 def build(image_set, args):
     root = Path(args.rsvg_mm_path)
     assert root.exists(), f'provided rsvg_mm path {root} does not exist'
@@ -137,7 +136,8 @@ def build(image_set, args):
             std=[0.229, 0.224, 0.225])
     ])
 
-    img_folder = 'data/rsvg_mm/images'
+    img_folder = str(root / 'images')
+
     dataset = RSVGDataset(img_folder, transform=input_transform, split=image_set, testmode=(image_set == 'test'))
     return dataset
 
@@ -149,7 +149,7 @@ if __name__ == '__main__':
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225])
     ])
-    img_folder = '../data/rsvg_mm/images'
+    img_folder = './rsvg_mm/images'
     image_set = 'train'
     dataset = RSVGDataset(img_folder, transform=input_transform, split=image_set, testmode=(image_set=='test'))
     sample_num = dataset.__len__()

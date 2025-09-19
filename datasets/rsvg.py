@@ -38,7 +38,7 @@ class RSVGDataset(data.Dataset):
         file = open(root / f"{self.split}.txt", "r", encoding="utf-8").readlines()
         Index = [int(index.strip('\n')) for index in file]
         count = 0
-        annotations = filelist(anno_path, '.xml')
+        annotations = sorted(filelist(anno_path, '.xml'))
         for anno_path in annotations:
             root = ET.parse(anno_path).getroot()
             for member in root.findall('object'):
