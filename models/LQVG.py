@@ -17,6 +17,7 @@ from .segmentation import VisionLanguageFusionModule
 from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
+from .pa_inject import PAInjector
 
 from transformers import BertTokenizer, BertModel, RobertaModel, RobertaTokenizerFast
 
@@ -121,6 +122,7 @@ class LQVG(nn.Module):
 
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
+        self.pa_injector = None
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -159,6 +161,25 @@ class LQVG(nn.Module):
 
         text_word_features = text_word_features.permute(1, 0, 2)  # [length, batch_size, c]
         text_word_initial_features = text_word_features
+
+        if self.pa_injector is not None and len(features) >= 3:
+            text_cls_for_pa = self.poolout_module(rearrange(text_word_initial_features, 'l b c -> b l c'))
+            text_vectors = {'cls': text_cls_for_pa}
+            pa_inputs = {}
+            name_to_index = {'c3': -4, 'c4': -3, 'c5': -2, 'c6': -1}
+            for name in self.pa_injector.pa.keys():
+                text_vectors[name] = text_cls_for_pa
+                idx = name_to_index.get(name)
+                if idx is None or abs(idx) > len(features):
+                    continue
+                pa_inputs[name] = features[idx].tensors
+            if pa_inputs:
+                pa_outputs = self.pa_injector(pa_inputs, text_vectors)
+                for name, tensor in pa_outputs.items():
+                    idx = name_to_index.get(name)
+                    if idx is None or abs(idx) > len(features):
+                        continue
+                    features[idx].tensors = tensor
 
         # Follow Deformable-DETR, we use the last three stages outputs from backbone
         for l, (feat, pos_l) in enumerate(zip(features[-3:], pos[-3:])):
@@ -382,6 +403,29 @@ def build(args):
         two_stage=args.two_stage,
         freeze_text_encoder=args.freeze_text_encoder
     )
+    chans = {}
+    if len(backbone.num_channels) >= 4:
+        chans['c3'] = backbone.num_channels[-4]
+    if len(backbone.num_channels) >= 3:
+        chans['c4'] = backbone.num_channels[-3]
+    if len(backbone.num_channels) >= 2:
+        chans['c5'] = backbone.num_channels[-2]
+    if len(backbone.num_channels) >= 1:
+        chans['c6'] = backbone.num_channels[-1]
+    if chans:
+        model.pa_injector = PAInjector(
+            chans=chans,
+            d_txt=model.hidden_dim,
+            use_c3=False,
+            use_c4='c4' in chans,
+            use_c5='c5' in chans,
+            use_c6='c6' in chans,
+            c4_spatial=True,
+            c5_spatial=True,
+            c6_bias=True,
+            ch_hidden=256,
+            sp_seed=64,
+        )
     matcher = build_matcher(args)
     weight_dict = {}
     weight_dict['loss_ce'] = args.cls_loss_coef
