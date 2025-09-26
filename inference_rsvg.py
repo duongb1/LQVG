@@ -146,7 +146,8 @@ def evaluate(test_loader, model, args):
         target_bbox[1], target_bbox[3] = (target_bbox[1] - dh) / ratio, (target_bbox[3] - dh) / ratio
 
         if Visualize_bbox:
-                source_img = Image.open(img_path[0]).convert('RGB')  # PIL image
+                imgL = Image.open(img_path[0]).convert('L')  
+                source_img = Image.merge('RGB', (imgL, imgL, imgL))
 
                 draw = ImageDraw.Draw(source_img)
                 draw_boxes = pred_bbox.tolist()
