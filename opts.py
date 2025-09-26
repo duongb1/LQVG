@@ -103,7 +103,7 @@ def get_args_parser():
     # dataset parameters
     # ['ytvos', 'davis', 'a2d', 'jhmdb', 'refcoco', 'refcoco+', 'refcocog', 'rsvg', 'all']
     # 'all': using the three ref datasets for pretraining
-    parser.add_argument('--dataset_file', default='rsvg', help='Dataset name')
+    parser.add_argument('--dataset_file', default='m4sardetvg', help='Dataset name')
     parser.add_argument('--rsvg_path', type=str, default='data/DIOR_RSVG')
     parser.add_argument('--rsvg_mm_path', type=str, default='data/rsvg_mm')
     parser.add_argument('--coco_path', type=str, default='data/coco')
