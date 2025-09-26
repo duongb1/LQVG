@@ -31,7 +31,7 @@ def _is_number(s: str) -> bool:
     if len(parts) > 2: return False
     return all(p.isdigit() for p in parts if p != "") and (s2.replace(".", "").isdigit())
 
-class RSVGDataset(data.Dataset):
+class M4SARDetVGDataset(data.Dataset):
     def __init__(self, images_path, anno_path, imsize=512, transform=None, augment=False,
                  split='train', testmode=False):
         self.images = []
@@ -202,13 +202,13 @@ def make_coco_transforms(image_set, cautious):
                                       std=[0.229, 0.224, 0.225])])
 
 def build(image_set, args):
-    root = Path(args.rsvg_path)
-    assert root.exists(), f'provided RSVG path {root} does not exist'
+    root = Path(args.m4sardetvg_path)
+    assert root.exists(), f'provided M4SARDetVG path {root} does not exist'
 
     img_folder = root / "JPEGImages"
     ann_folder = root / "Annotations"
 
-    dataset = RSVGDataset(
+    dataset = M4SARDetVGDataset(
         img_folder,
         ann_folder,
         transform=make_coco_transforms(image_set, False),
