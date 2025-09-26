@@ -83,7 +83,7 @@ class RSVGDataset(data.Dataset):
         bbox = bbox.unsqueeze(0)
 
         target = {}
-        target["dataset_name"] = "M4SARDetVG"
+        target["dataset_name"] = "m4sardetvg"
         target["boxes"] = bbox
         target["labels"] = torch.tensor([1])
         if caption is not None:

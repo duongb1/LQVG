@@ -26,7 +26,7 @@ def main(args):
     os.environ["MDETR_CPU_REDUCE"] = "1"
 
     args.masks = False
-    assert args.dataset_file in ["M4SARDetVG", "rsvg", "rsvg_mm", "refcoco", "refcoco+", "refcocog", "all"]
+    assert args.dataset_file in ["m4sardetvg", "rsvg", "rsvg_mm", "refcoco", "refcoco+", "refcocog", "all"]
 
     utils.init_distributed_mode(args)
     print("git:\n  {}\n".format(utils.get_sha()))
