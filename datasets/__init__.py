@@ -2,6 +2,7 @@ import torch.utils.data
 import torchvision
 
 from .rsvg import build as build_rsvg
+from .m4sardetvg import build as build_m4sardetvg
 from .rsvg_mm import build as build_rsvg_mm
 
 
@@ -19,7 +20,7 @@ def build_dataset(dataset_file: str, image_set: str, args):
     if dataset_file == 'rsvg':
         return build_rsvg(image_set, args)
     if dataset_file == 'm4sardetvg':
-        return build_rsvg(image_set, args)
+        return build_m4sardetvg(image_set, args)
     if dataset_file == 'rsvg_mm':
         return build_rsvg_mm(image_set, args)
 

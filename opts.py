@@ -103,7 +103,8 @@ def get_args_parser():
     # dataset parameters
     # ['ytvos', 'davis', 'a2d', 'jhmdb', 'refcoco', 'refcoco+', 'refcocog', 'rsvg', 'all']
     # 'all': using the three ref datasets for pretraining
-    parser.add_argument('--dataset_file', default='m4sardetvg', help='Dataset name')
+    parser.add_argument('--m4sardetvg_path', type=str, default='kaggle/input/m4sardetvg/M4SARDetVG/')
+    parser.add_argument('--dataset_file', default='rsvg', help='Dataset name')
     parser.add_argument('--rsvg_path', type=str, default='data/DIOR_RSVG')
     parser.add_argument('--rsvg_mm_path', type=str, default='data/rsvg_mm')
     parser.add_argument('--coco_path', type=str, default='data/coco')
@@ -112,7 +113,7 @@ def get_args_parser():
     parser.add_argument('--a2d_path', type=str, default='data/a2d_sentences')
     parser.add_argument('--jhmdb_path', type=str, default='data/jhmdb_sentences')
     parser.add_argument('--max_skip', default=3, type=int, help="max skip frame number")
-    parser.add_argument('--max_size', default=640, type=int, help="max size for the frame")
+    parser.add_argument('--max_size', default=512, type=int, help="max size for the frame")
     parser.add_argument('--binary', action='store_true')
     parser.add_argument('--remove_difficult', action='store_true')
 
