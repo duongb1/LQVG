@@ -139,6 +139,18 @@ def get_args_parser():
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
     parser.add_argument('--cache_mode', default=False, action='store_true', help='whether to cache images on memory')
+    
+    #LoRa
+    parser.add_argument('--lora', action='store_true')
+    parser.add_argument('--lora_preset', type=str, default='balanced', choices=['light', 'balanced', 'max'])
+    parser.add_argument('--lora_text', action='store_true')
+    parser.add_argument('--lora_fusion', action='store_true')
+    parser.add_argument('--lora_decoder', action='store_true')
+    parser.add_argument('--lora_encoder', action='store_true')
+    parser.add_argument('--lora_input_proj', action='store_true')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=32)
+    parser.add_argument('--lora_dropout', type=float, default=0.05)
     return parser
 
 
