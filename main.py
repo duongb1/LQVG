@@ -214,6 +214,16 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('ReferFormer pretrain training and evaluation script', parents=[opts.get_args_parser()])
+    parser.add_argument('--lora', action='store_true')
+    parser.add_argument('--lora_preset', type=str, default='balanced', choices=['light', 'balanced', 'max'])
+    parser.add_argument('--lora_text', action='store_true')
+    parser.add_argument('--lora_fusion', action='store_true')
+    parser.add_argument('--lora_decoder', action='store_true')
+    parser.add_argument('--lora_encoder', action='store_true')
+    parser.add_argument('--lora_input_proj', action='store_true')
+    parser.add_argument('--lora_rank', type=int, default=8)
+    parser.add_argument('--lora_alpha', type=int, default=32)
+    parser.add_argument('--lora_dropout', type=float, default=0.05)
     args = parser.parse_args()
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
