@@ -131,12 +131,22 @@ class LoRAMultiheadAttention(nn.Module):
         attn_logits = torch.matmul(q, k.transpose(-2, -1))
 
         if attn_mask is not None:
-            if attn_mask.dim() == 2:
-                attn_logits += attn_mask.unsqueeze(0).unsqueeze(0)
-            elif attn_mask.dim() == 3:
-                attn_logits += attn_mask.unsqueeze(0)
+            if attn_mask.dtype == torch.bool:
+                if attn_mask.dim() == 2:
+                    bool_mask = attn_mask.unsqueeze(0).unsqueeze(0)
+                elif attn_mask.dim() == 3:
+                    bool_mask = attn_mask.unsqueeze(0)
+                else:
+                    raise ValueError("Unsupported boolean attn_mask dimension")
+                fill_value = torch.finfo(attn_logits.dtype).min
+                attn_logits = attn_logits.masked_fill(bool_mask, fill_value)
             else:
-                raise ValueError("Unsupported attn_mask dimension")
+                if attn_mask.dim() == 2:
+                    attn_logits = attn_logits + attn_mask.unsqueeze(0).unsqueeze(0)
+                elif attn_mask.dim() == 3:
+                    attn_logits = attn_logits + attn_mask.unsqueeze(0)
+                else:
+                    raise ValueError("Unsupported attn_mask dimension")
 
         mask = None
         if key_padding_mask is not None:

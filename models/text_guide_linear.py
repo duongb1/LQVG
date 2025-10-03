@@ -70,24 +70,50 @@ class MM_adaption_linear(nn.Module):
 class MM_adaption_conv_2d(nn.Module):
     def __init__(self, d_model=256, d_model_visual=256, down_rate=4, d_text=256):
         """
-        Điều biến feature map trước input_proj:
+        Điều biến feature map sau input_proj:
           x: [B, C_v, H, W], word_feat_embed: [B, L_t, d_text]
         """
         super().__init__()
-        mid = max(1, d_model // down_rate)
-        self.down = nn.Conv2d(d_model_visual, mid, kernel_size=3, stride=1, padding=1, bias=False)
-        self.fuse = GF_block(d_model=d_model, d_model_visual=d_model_visual, d_text=d_text, isTR=False)
-        self.gen_scale = nn.Linear(d_model, mid, bias=True)
-        self.up = nn.Conv2d(mid, d_model_visual, kernel_size=1, bias=False)
+        self.d_model = d_model
+        self.d_text = d_text
+        self.down_rate = max(1, down_rate)
+        self.mid = max(1, d_model // self.down_rate)
+        self.gen_scale = nn.Linear(d_model, self.mid, bias=True)
         # near-identity init
         nn.init.zeros_(self.gen_scale.weight)
         nn.init.zeros_(self.gen_scale.bias)
 
+        self._visual_channels = None
+        self.down: nn.Conv2d
+        self.up: nn.Conv2d
+        self.fuse: GF_block
+        self._set_visual_dim(d_model_visual)
+
+    def _set_visual_dim(self, channels: int) -> None:
+        channels = int(channels)
+        if self._visual_channels == channels:
+            return
+        self._visual_channels = channels
+        self.down = nn.Conv2d(channels, self.mid, kernel_size=3, stride=1, padding=1, bias=False)
+        self.up = nn.Conv2d(self.mid, channels, kernel_size=1, bias=False)
+        self.fuse = GF_block(d_model=self.d_model, d_model_visual=channels, d_text=self.d_text, isTR=False)
+
     def forward(self, x, word_feat_embed):
+        if x.dim() != 4:
+            raise ValueError(f"MM_adaption_conv_2d expects 4D input, got {x.shape}")
+
+        visual_channels = x.shape[1]
+        if self._visual_channels != visual_channels:
+            # reconfigure to current channel count (e.g. when loading old checkpoints)
+            self._set_visual_dim(visual_channels)
+            self.down.to(device=x.device, dtype=x.dtype)
+            self.up.to(device=x.device, dtype=x.dtype)
+            self.fuse.to(device=x.device, dtype=x.dtype)
+
         B, _, H, W = x.shape
         x_mid = self.down(x)                            # [B, mid, H, W]
         cond = self.fuse(x, word_feat_embed)            # [B, 1, d_model]
         scale = self.gen_scale(cond).transpose(1, 2)    # [B, mid, 1]
         x_mid = x_mid * scale[..., None]                # [B, mid, H, W]
-        x_delta = self.up(x_mid)                        # [B, C_v, H, W]
+        x_delta = self.up(x_mid)                        # [B, self._visual_channels, H, W]
         return x + x_delta                              # residual
