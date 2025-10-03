@@ -150,35 +150,36 @@ class LoRAMultiheadAttention(nn.Module):
         k = self.k_proj(key)
         v = self.v_proj(value)
 
+        # sau khi q = self.q_proj(query); k = ...; v = ...
+        Lq, Nq, _ = q.shape
+        Lk, Nk, _ = k.shape
+        Lv, Nv, _ = v.shape
+        assert Nq == Nk == Nv, "Batch (N) must match for q/k/v"
+        
         scaling = float(self.head_dim) ** -0.5
-        L, N, _ = q.shape
-        q = (
-            q.permute(1, 0, 2)
-            .contiguous()
-            .view(N, L, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-            * scaling
-        )
-        k = (
-            k.permute(1, 0, 2)
-            .contiguous()
-            .view(N, L, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        v = (
-            v.permute(1, 0, 2)
-            .contiguous()
-            .view(N, L, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-
+        
+        # reshape từng cái theo chiều dài riêng của nó
+        q = (q.permute(1, 0, 2).contiguous()
+               .view(Nq, Lq, self.num_heads, self.head_dim)
+               .transpose(1, 2)) * scaling
+        
+        k = (k.permute(1, 0, 2).contiguous()
+               .view(Nk, Lk, self.num_heads, self.head_dim)
+               .transpose(1, 2))
+        
+        v = (v.permute(1, 0, 2).contiguous()
+               .view(Nv, Lv, self.num_heads, self.head_dim)
+               .transpose(1, 2))
+        
+        # logits: (N, heads, Lq, Lk)
         attn_logits = torch.matmul(q, k.transpose(-2, -1))
-
+        
+        # attn_mask có thể là (Lq, Lk) hoặc (N*heads, Lq, Lk) -> broadcast đúng
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                if attn_mask.dim() == 2:
+                if attn_mask.dim() == 2:      # (Lq, Lk)
                     bool_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-                elif attn_mask.dim() == 3:
+                elif attn_mask.dim() == 3:    # (N*heads, Lq, Lk)
                     bool_mask = attn_mask.unsqueeze(0)
                 else:
                     raise ValueError("Unsupported boolean attn_mask dimension")
@@ -191,40 +192,29 @@ class LoRAMultiheadAttention(nn.Module):
                     attn_logits = attn_logits + attn_mask.unsqueeze(0)
                 else:
                     raise ValueError("Unsupported attn_mask dimension")
-
+        
+        # key_padding_mask áp theo chiều Lk
         pad_mask = None
-        if key_padding_mask is not None:
-            pad_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+        if key_padding_mask is not None:      # (N, Lk)
+            pad_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (N,1,1,Lk)
             fill_value = torch.finfo(attn_logits.dtype).min
             attn_logits = attn_logits.masked_fill(pad_mask, fill_value)
-
-        attn_logits = attn_logits - attn_logits.max(dim=-1, keepdim=True).values
-        attn_weights = torch.softmax(attn_logits, dim=-1)
+        
+        # softmax & dropout như cũ...
+        attn_weights = torch.softmax(attn_logits - attn_logits.max(dim=-1, keepdim=True).values, dim=-1)
         if pad_mask is not None:
             attn_weights = attn_weights.masked_fill(pad_mask, 0.0)
-            denom = attn_weights.sum(dim=-1, keepdim=True).clamp_min(
-                torch.finfo(attn_weights.dtype).tiny
-            )
+            denom = attn_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(attn_weights.dtype).tiny)
             attn_weights = attn_weights / denom
         attn_weights = torch.dropout(attn_weights, self.dropout_p, self.training)
-
-        attn_output = torch.matmul(attn_weights, v)  # (N, heads, L, head_dim)
-        attn_output = (
-            attn_output.transpose(1, 2)
-            .contiguous()
-            .view(N, L, self.embed_dim)
-            .permute(1, 0, 2)
-        )
+        
+        # output có chiều Lq
+        attn_output = torch.matmul(attn_weights, v)                   # (N, heads, Lq, head_dim)
+        attn_output = (attn_output.transpose(1, 2).contiguous()
+                                      .view(Nq, Lq, self.embed_dim)   # (N, Lq, C)
+                                      .permute(1, 0, 2))              # (Lq, N, C)
         attn_output = self.out_proj(attn_output)
 
-        if not need_weights:
-            return attn_output, None
-
-        # average heads
-        attn_weights_out = (
-            attn_weights.mean(dim=1) if average_attn_weights else attn_weights
-        )
-        return attn_output, attn_weights_out
 
 
 def _match_any(name: str, regex_list: Sequence[str]) -> bool:
