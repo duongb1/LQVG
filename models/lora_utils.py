@@ -130,11 +130,11 @@ class LoRAMultiheadAttention(nn.Module):
         key: Optional[torch.Tensor] = None,
         value: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
-        need_weights: bool = False,
+        need_weights: bool = True,                  # mặc định True như torch MHA
         attn_mask: Optional[torch.Tensor] = None,
         average_attn_weights: bool = True,
-        is_causal: bool = False,
-        # --- compatibility with legacy fusion wrappers expecting x ---
+        is_causal: bool = False,                    # không dùng, để tương thích
+        # --- tương thích legacy wrappers dùng tham số x ---
         x: torch.Tensor = None,
         **kwargs,
     ):
@@ -145,75 +145,101 @@ class LoRAMultiheadAttention(nn.Module):
             key = query
         if value is None:
             value = key
-
-        q = self.q_proj(query)
-        k = self.k_proj(key)
-        v = self.v_proj(value)
-
-        # sau khi q = self.q_proj(query); k = ...; v = ...
+    
+        # QKV chiếu LoRA
+        q = self.q_proj(query)   # (Lq, N, C)
+        k = self.k_proj(key)     # (Lk, N, C)
+        v = self.v_proj(value)   # (Lv, N, C)
+    
+        # Kích thước
         Lq, Nq, _ = q.shape
         Lk, Nk, _ = k.shape
         Lv, Nv, _ = v.shape
-        assert Nq == Nk == Nv, "Batch (N) must match for q/k/v"
-        
+        assert Nq == Nk == Nv, "Batch size (N) của q/k/v phải giống nhau"
+    
+        # reshape -> (N, heads, L*, head_dim)
         scaling = float(self.head_dim) ** -0.5
-        
-        # reshape từng cái theo chiều dài riêng của nó
-        q = (q.permute(1, 0, 2).contiguous()
-               .view(Nq, Lq, self.num_heads, self.head_dim)
-               .transpose(1, 2)) * scaling
-        
-        k = (k.permute(1, 0, 2).contiguous()
-               .view(Nk, Lk, self.num_heads, self.head_dim)
-               .transpose(1, 2))
-        
-        v = (v.permute(1, 0, 2).contiguous()
-               .view(Nv, Lv, self.num_heads, self.head_dim)
-               .transpose(1, 2))
-        
+        q = (q.permute(1, 0, 2).contiguous().view(Nq, Lq, self.num_heads, self.head_dim).transpose(1, 2)) * scaling
+        k =  k.permute(1, 0, 2).contiguous().view(Nk, Lk, self.num_heads, self.head_dim).transpose(1, 2)
+        v =  v.permute(1, 0, 2).contiguous().view(Nv, Lv, self.num_heads, self.head_dim).transpose(1, 2)
+    
         # logits: (N, heads, Lq, Lk)
         attn_logits = torch.matmul(q, k.transpose(-2, -1))
-        
-        # attn_mask có thể là (Lq, Lk) hoặc (N*heads, Lq, Lk) -> broadcast đúng
+    
+        # ---- attn_mask ----
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                if attn_mask.dim() == 2:      # (Lq, Lk)
-                    bool_mask = attn_mask.unsqueeze(0).unsqueeze(0)
-                elif attn_mask.dim() == 3:    # (N*heads, Lq, Lk)
-                    bool_mask = attn_mask.unsqueeze(0)
-                else:
-                    raise ValueError("Unsupported boolean attn_mask dimension")
-                fill_value = torch.finfo(attn_logits.dtype).min
-                attn_logits = attn_logits.masked_fill(bool_mask, fill_value)
-            else:
-                if attn_mask.dim() == 2:
-                    attn_logits = attn_logits + attn_mask.unsqueeze(0).unsqueeze(0)
+                # bool mask: True = masked
+                if attn_mask.dim() == 2 and attn_mask.shape == (Lq, Lk):
+                    mask = attn_mask.unsqueeze(0).unsqueeze(0)                       # (1,1,Lq,Lk)
+                    fill_value = torch.finfo(attn_logits.dtype).min
+                    attn_logits = attn_logits.masked_fill(mask, fill_value)
                 elif attn_mask.dim() == 3:
-                    attn_logits = attn_logits + attn_mask.unsqueeze(0)
+                    if attn_mask.shape[0] == Nq * self.num_heads:                    # (N*H,Lq,Lk)
+                        mask = attn_mask.view(Nq, self.num_heads, Lq, Lk)
+                        fill_value = torch.finfo(attn_logits.dtype).min
+                        attn_logits = attn_logits.masked_fill(mask, fill_value)
+                    elif attn_mask.shape[0] == Nq:                                   # (N,Lq,Lk)
+                        mask = attn_mask.unsqueeze(1)                                # (N,1,Lq,Lk)
+                        fill_value = torch.finfo(attn_logits.dtype).min
+                        attn_logits = attn_logits.masked_fill(mask, fill_value)
+                    else:
+                        raise ValueError("attn_mask bool 3D phải có batch N hoặc N*heads")
                 else:
-                    raise ValueError("Unsupported attn_mask dimension")
-        
-        # key_padding_mask áp theo chiều Lk
+                    raise ValueError("attn_mask(bool) phải là (Lq,Lk) hoặc (N,Lq,Lk) hoặc (N*heads,Lq,Lk)")
+            else:
+                # float mask: cộng trực tiếp
+                if attn_mask.dim() == 2 and attn_mask.shape == (Lq, Lk):
+                    attn_logits = attn_logits + attn_mask.unsqueeze(0).unsqueeze(0)  # (1,1,Lq,Lk)
+                elif attn_mask.dim() == 3:
+                    if attn_mask.shape[0] == Nq * self.num_heads:                    # (N*H,Lq,Lk)
+                        m = attn_mask.view(Nq, self.num_heads, Lq, Lk)
+                        attn_logits = attn_logits + m
+                    elif attn_mask.shape[0] == Nq:                                   # (N,Lq,Lk)
+                        attn_logits = attn_logits + attn_mask.unsqueeze(1)          # (N,1,Lq,Lk)
+                    else:
+                        raise ValueError("attn_mask(float) 3D phải có batch N hoặc N*heads")
+                else:
+                    raise ValueError("attn_mask(float) phải là (Lq,Lk) hoặc (N,Lq,Lk) hoặc (N*heads,Lq,Lk)")
+    
+        # ---- key_padding_mask (N, Lk): True = pad -> -inf ----
         pad_mask = None
-        if key_padding_mask is not None:      # (N, Lk)
+        if key_padding_mask is not None:
+            if key_padding_mask.shape != (Nq, Lk):
+                raise ValueError(f"key_padding_mask phải có shape (N, Lk) = ({Nq},{Lk}), nhận {tuple(key_padding_mask.shape)}")
             pad_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (N,1,1,Lk)
             fill_value = torch.finfo(attn_logits.dtype).min
             attn_logits = attn_logits.masked_fill(pad_mask, fill_value)
-        
-        # softmax & dropout như cũ...
-        attn_weights = torch.softmax(attn_logits - attn_logits.max(dim=-1, keepdim=True).values, dim=-1)
+    
+        # softmax ổn định + dropout
+        attn_logits = attn_logits - attn_logits.max(dim=-1, keepdim=True).values
+        attn_weights = torch.softmax(attn_logits, dim=-1)          # (N, heads, Lq, Lk)
+    
+        # re-normalize nếu có pad_mask (đảm bảo tổng = 1)
         if pad_mask is not None:
             attn_weights = attn_weights.masked_fill(pad_mask, 0.0)
             denom = attn_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(attn_weights.dtype).tiny)
             attn_weights = attn_weights / denom
+    
         attn_weights = torch.dropout(attn_weights, self.dropout_p, self.training)
-        
-        # output có chiều Lq
-        attn_output = torch.matmul(attn_weights, v)                   # (N, heads, Lq, head_dim)
-        attn_output = (attn_output.transpose(1, 2).contiguous()
-                                      .view(Nq, Lq, self.embed_dim)   # (N, Lq, C)
-                                      .permute(1, 0, 2))              # (Lq, N, C)
+    
+        # output: (N, heads, Lq, head_dim) -> (Lq, N, C)
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(Nq, Lq, self.embed_dim).permute(1, 0, 2)
         attn_output = self.out_proj(attn_output)
+    
+        # Trả về giống nn.MultiheadAttention
+        if not need_weights:
+            return attn_output, None
+    
+        if average_attn_weights:
+            # (N, heads, Lq, Lk) -> (N, Lq, Lk) -> (Lq, N, Lk)
+            attn_weights_out = attn_weights.mean(dim=1).permute(1, 0, 2).contiguous()
+        else:
+            # giữ nguyên (N, heads, Lq, Lk)
+            attn_weights_out = attn_weights
+    
+        return attn_output, attn_weights_out
 
 
 
