@@ -292,52 +292,78 @@ class VisionLanguageBlock(nn.Module):
                      pos: Optional[Tensor] = None,
                      query_pos: Optional[Tensor] = None):
         b = tgt.size(1)
-        # self attn
+    
+        # ===========================
+        # Self-Attention (with SR)
+        # ===========================
         q = k = self.with_pos_embed(tgt, query_pos)
-        if self.sr_ratio > 1: # downsample
+    
+        if self.sr_ratio > 1:
+            # to fmap
             q = rearrange(q, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             k = rearrange(k, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             v = rearrange(tgt, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
+    
             # downsample
-            new_h = int(h * 1./self.sr_ratio)
-            new_w = int(w * 1./self.sr_ratio)
+            new_h = max(1, int(h * 1.0 / self.sr_ratio))
+            new_w = max(1, int(w * 1.0 / self.sr_ratio))
             size = (new_h, new_w)
             q = F.interpolate(q, size=size, mode='nearest')
             k = F.interpolate(k, size=size, mode='nearest')
             v = F.interpolate(v, size=size, mode='nearest')
-            # shape for transformer
+    
+            # back to (L, B, C)
             q = rearrange(q, '(b t) c h w -> (t h w) b c', t=t)
             k = rearrange(k, '(b t) c h w -> (t h w) b c', t=t)
             v = rearrange(v, '(b t) c h w -> (t h w) b c', t=t)
-            # downsample mask
-            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b*t, h, w)
-            tgt_key_padding_mask = F.interpolate(tgt_key_padding_mask[None].float(), size=(new_h, new_w), mode='nearest').bool()[0] 
-            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b, t, new_h, new_w).flatten(1)
+    
+            # downsample mask (nếu có)
+            if tgt_key_padding_mask is not None:
+                _mask = tgt_key_padding_mask.reshape(b * t, h, w).float()
+                _mask = F.interpolate(_mask[None], size=(new_h, new_w), mode='nearest').bool()[0]  # (b*t,new_h,new_w)
+                tgt_key_padding_mask = _mask.reshape(b, t, new_h, new_w).flatten(1)               # (b, t*new_h*new_w)
+            # else giữ None
         else:
             v = tgt
-        tgt2 = self.self_attn(q, k, value=v, attn_mask=None,
-                              key_padding_mask=tgt_key_padding_mask)[0] # [H*W, B*T, C]
+            new_h, new_w = h, w  # để dùng lại khi upsample
+    
+        # call MHA (tolerate tuple or tensor return)
+        sa_out = self.self_attn(q, k, value=v, attn_mask=None,
+                                key_padding_mask=tgt_key_padding_mask)
+        tgt2 = sa_out[0] if isinstance(sa_out, (tuple, list)) else sa_out  # [Lq, B, C]
+    
         if self.sr_ratio > 1:
+            # upsample lại về (h, w)
             tgt2 = rearrange(tgt2, '(t h w) b c -> (b t) c h w', t=t, h=new_h, w=new_w)
-            size = (h, w)  # recover to origin size
-            tgt2 = F.interpolate(tgt2, size=size, mode='bilinear', align_corners=False) # [B*T, C, H, W]
+            tgt2 = F.interpolate(tgt2, size=(h, w), mode='bilinear', align_corners=False)
             tgt2 = rearrange(tgt2, '(b t) c h w -> (t h w) b c', t=t)
+    
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
-
-        # cross attn
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=None,
-                                   key_padding_mask=memory_key_padding_mask)[0]
+    
+        # ===========================
+        # Cross-Attention
+        # ===========================
+        ca_out = self.multihead_attn(
+            query=self.with_pos_embed(tgt, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=None,
+            key_padding_mask=memory_key_padding_mask
+        )
+        tgt2 = ca_out[0] if isinstance(ca_out, (tuple, list)) else ca_out
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
-
-        # ffn
+    
+        # ===========================
+        # FFN
+        # ===========================
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
         tgt = tgt + self.dropout3(tgt2)
         tgt = self.norm3(tgt)
+    
         return tgt
+
 
     def forward_pre(self, tgt, memory, t, h, w,
                     tgt_key_padding_mask: Optional[Tensor] = None,
@@ -345,52 +371,79 @@ class VisionLanguageBlock(nn.Module):
                     pos: Optional[Tensor] = None,
                     query_pos: Optional[Tensor] = None):
         b = tgt.size(1)
-        # self attn
+    
+        # ===========================
+        # Self-Attention (pre-norm)
+        # ===========================
         tgt2 = self.norm1(tgt)
         q = k = self.with_pos_embed(tgt2, query_pos)
-        if self.sr_ratio > 1: # downsample
+    
+        if self.sr_ratio > 1:  # downsample
+            # to fmap
             q = rearrange(q, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             k = rearrange(k, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             v = rearrange(tgt, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
-            # downsample
-            new_h = int(h * 1./self.sr_ratio)
-            new_w = int(w * 1./self.sr_ratio)
+    
+            # safe ds size
+            new_h = max(1, int(h * 1.0 / self.sr_ratio))
+            new_w = max(1, int(w * 1.0 / self.sr_ratio))
             size = (new_h, new_w)
+    
+            # downsample q/k/v
             q = F.interpolate(q, size=size, mode='nearest')
             k = F.interpolate(k, size=size, mode='nearest')
             v = F.interpolate(v, size=size, mode='nearest')
-            # shape for transformer
+    
+            # back to (L, B, C)
             q = rearrange(q, '(b t) c h w -> (t h w) b c', t=t)
             k = rearrange(k, '(b t) c h w -> (t h w) b c', t=t)
             v = rearrange(v, '(b t) c h w -> (t h w) b c', t=t)
-            # downsample mask
-            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b*t, h, w)
-            tgt_key_padding_mask = F.interpolate(tgt_key_padding_mask[None].float(), size=(new_h, new_w), mode='nearest').bool()[0] 
-            tgt_key_padding_mask = tgt_key_padding_mask.reshape(b, t, new_h, new_w).flatten(1)
+    
+            # downsample mask (only if provided)
+            if tgt_key_padding_mask is not None:
+                _mask = tgt_key_padding_mask.reshape(b * t, h, w).float()
+                _mask = F.interpolate(_mask[None], size=(new_h, new_w), mode='nearest').bool()[0]
+                tgt_key_padding_mask = _mask.reshape(b, t, new_h, new_w).flatten(1)
         else:
             v = tgt2
-        tgt2 = self.self_attn(q, k, value=v, attn_mask=None,
-                              key_padding_mask=tgt_key_padding_mask)[0] # [T*H*W, B, C]
+            new_h, new_w = h, w  # for symmetry when upsampling later
+    
+        # tolerant to tensor/tuple return (nn.MHA or LoRA-wrapped)
+        sa_out = self.self_attn(q, k, value=v, attn_mask=None,
+                                key_padding_mask=tgt_key_padding_mask)
+        tgt_sa = sa_out[0] if isinstance(sa_out, (tuple, list)) else sa_out  # [Lq, B, C]
+    
         if self.sr_ratio > 1:
-            tgt2 = rearrange(tgt2, '(t h w) b c -> (b t) c h w', t=t, h=new_h, w=new_w)
-            size = (h, w)  # recover to origin size
-            tgt2 = F.interpolate(tgt2, size=size, mode='bilinear', align_corners=False) # [B*T, C, H, W]
-            tgt2 = rearrange(tgt2, '(b t) c h w -> (t h w) b c', t=t)
-        tgt = tgt + self.dropout1(tgt2)
-
-        # cross attn
-        tgt2 = self.norm2(tgt)
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=None,
-                                   key_padding_mask=memory_key_padding_mask)[0]
-        tgt = tgt + self.dropout2(tgt2)
-
-        # ffn
-        tgt2 = self.norm3(tgt)
-        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout3(tgt2)
+            # upsample back to original grid
+            tgt_sa = rearrange(tgt_sa, '(t h w) b c -> (b t) c h w', t=t, h=new_h, w=new_w)
+            tgt_sa = F.interpolate(tgt_sa, size=(h, w), mode='bilinear', align_corners=False)
+            tgt_sa = rearrange(tgt_sa, '(b t) c h w -> (t h w) b c', t=t)
+    
+        tgt = tgt + self.dropout1(tgt_sa)
+    
+        # ===========================
+        # Cross-Attention (pre-norm)
+        # ===========================
+        ca_in = self.norm2(tgt)
+        ca_out = self.multihead_attn(
+            query=self.with_pos_embed(ca_in, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=None,
+            key_padding_mask=memory_key_padding_mask
+        )
+        tgt_ca = ca_out[0] if isinstance(ca_out, (tuple, list)) else ca_out
+        tgt = tgt + self.dropout2(tgt_ca)
+    
+        # ===========================
+        # FFN (pre-norm)
+        # ===========================
+        ffn_in = self.norm3(tgt)
+        tgt_ffn = self.linear2(self.dropout(self.activation(self.linear1(ffn_in))))
+        tgt = tgt + self.dropout3(tgt_ffn)
+    
         return tgt
+
 
     def forward(self, tgt, memory, t, h, w,
                 tgt_key_padding_mask: Optional[Tensor] = None,
