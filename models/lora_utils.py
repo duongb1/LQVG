@@ -6,13 +6,16 @@ import torch.nn as nn
 
 try:  # pragma: no cover - optional dependency
     from peft import LoraConfig, TaskType, get_peft_model
+
     _HAS_PEFT = True
 except Exception:  # pragma: no cover - optional dependency
     _HAS_PEFT = False
 
 
 class LoRALinear(nn.Module):
-    def __init__(self, linear: nn.Linear, r: int = 8, alpha: int = 32, dropout: float = 0.0):
+    def __init__(
+        self, linear: nn.Linear, r: int = 8, alpha: int = 32, dropout: float = 0.0
+    ):
         super().__init__()
         if not isinstance(linear, nn.Linear):
             raise TypeError("LoRALinear expects an nn.Linear module")
@@ -29,7 +32,7 @@ class LoRALinear(nn.Module):
             self.bias.requires_grad_(False)
         self.A = nn.Linear(self.in_features, r, bias=False)
         self.B = nn.Linear(r, self.out_features, bias=False)
-        nn.init.kaiming_uniform_(self.A.weight, a=5 ** 0.5)
+        nn.init.kaiming_uniform_(self.A.weight, a=5**0.5)
         nn.init.zeros_(self.B.weight)
         self.scaling = self.alpha / max(1, self.r)
 
@@ -50,7 +53,7 @@ class ConvLoRA1x1(nn.Module):
         out_channels = conv1x1.out_channels
         self.A = nn.Conv2d(in_channels, r, kernel_size=1, bias=False)
         self.B = nn.Conv2d(r, out_channels, kernel_size=1, bias=False)
-        nn.init.kaiming_uniform_(self.A.weight, a=5 ** 0.5)
+        nn.init.kaiming_uniform_(self.A.weight, a=5**0.5)
         nn.init.zeros_(self.B.weight)
         self.scaling = alpha / max(1, r)
 
@@ -59,10 +62,18 @@ class ConvLoRA1x1(nn.Module):
 
 
 class LoRAMultiheadAttention(nn.Module):
-    def __init__(self, attn: nn.MultiheadAttention, r: int = 8, alpha: int = 32, dropout: float = 0.05):
+    def __init__(
+        self,
+        attn: nn.MultiheadAttention,
+        r: int = 8,
+        alpha: int = 32,
+        dropout: float = 0.05,
+    ):
         super().__init__()
         if attn.batch_first:
-            raise ValueError("LoRAMultiheadAttention does not currently support batch_first=True")
+            raise ValueError(
+                "LoRAMultiheadAttention does not currently support batch_first=True"
+            )
         if attn.bias_k is not None or attn.bias_v is not None:
             raise ValueError("LoRAMultiheadAttention does not support bias_k or bias_v")
 
@@ -81,15 +92,17 @@ class LoRAMultiheadAttention(nn.Module):
         k_linear = nn.Linear(self.embed_dim, self.embed_dim, bias=in_proj_bias)
         v_linear = nn.Linear(self.embed_dim, self.embed_dim, bias=in_proj_bias)
 
-        q_linear.weight.data.copy_(weight[:self.embed_dim])
-        k_linear.weight.data.copy_(weight[self.embed_dim:2 * self.embed_dim])
-        v_linear.weight.data.copy_(weight[2 * self.embed_dim:])
+        q_linear.weight.data.copy_(weight[: self.embed_dim])
+        k_linear.weight.data.copy_(weight[self.embed_dim : 2 * self.embed_dim])
+        v_linear.weight.data.copy_(weight[2 * self.embed_dim :])
         if in_proj_bias:
-            q_linear.bias.data.copy_(bias[:self.embed_dim])
-            k_linear.bias.data.copy_(bias[self.embed_dim:2 * self.embed_dim])
-            v_linear.bias.data.copy_(bias[2 * self.embed_dim:])
+            q_linear.bias.data.copy_(bias[: self.embed_dim])
+            k_linear.bias.data.copy_(bias[self.embed_dim : 2 * self.embed_dim])
+            v_linear.bias.data.copy_(bias[2 * self.embed_dim :])
 
-        out_linear = nn.Linear(self.embed_dim, self.embed_dim, bias=attn.out_proj.bias is not None)
+        out_linear = nn.Linear(
+            self.embed_dim, self.embed_dim, bias=attn.out_proj.bias is not None
+        )
         out_linear.weight.data.copy_(attn.out_proj.weight.detach())
         if attn.out_proj.bias is not None:
             out_linear.bias.data.copy_(attn.out_proj.bias.detach())
@@ -111,18 +124,20 @@ class LoRAMultiheadAttention(nn.Module):
         x = x.transpose(1, 2).contiguous().view(N, L, self.embed_dim)
         return x.permute(1, 0, 2)
 
-    def forward(self,
-                query: torch.Tensor = None,
-                key: Optional[torch.Tensor] = None,
-                value: Optional[torch.Tensor] = None,
-                key_padding_mask: Optional[torch.Tensor] = None,
-                need_weights: bool = False,
-                attn_mask: Optional[torch.Tensor] = None,
-                average_attn_weights: bool = True,
-                is_causal: bool = False,
-                # --- compatibility with legacy fusion wrappers expecting x ---
-                x: torch.Tensor = None,
-                **kwargs):
+    def forward(
+        self,
+        query: torch.Tensor = None,
+        key: Optional[torch.Tensor] = None,
+        value: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
+        average_attn_weights: bool = True,
+        is_causal: bool = False,
+        # --- compatibility with legacy fusion wrappers expecting x ---
+        x: torch.Tensor = None,
+        **kwargs,
+    ):
         # map legacy signature (x, key, value, ...) -> (query, key, value, ...)
         if query is None and x is not None:
             query = x
@@ -130,19 +145,35 @@ class LoRAMultiheadAttention(nn.Module):
             key = query
         if value is None:
             value = key
-    
+
         q = self.q_proj(query)
         k = self.k_proj(key)
         v = self.v_proj(value)
-    
+
         scaling = float(self.head_dim) ** -0.5
         L, N, _ = q.shape
-        q = q.permute(1, 0, 2).contiguous().view(N, L, self.num_heads, self.head_dim).transpose(1, 2) * scaling
-        k = k.permute(1, 0, 2).contiguous().view(N, L, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.permute(1, 0, 2).contiguous().view(N, L, self.num_heads, self.head_dim).transpose(1, 2)
-    
+        q = (
+            q.permute(1, 0, 2)
+            .contiguous()
+            .view(N, L, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+            * scaling
+        )
+        k = (
+            k.permute(1, 0, 2)
+            .contiguous()
+            .view(N, L, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+        v = (
+            v.permute(1, 0, 2)
+            .contiguous()
+            .view(N, L, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
+
         attn_logits = torch.matmul(q, k.transpose(-2, -1))
-    
+
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
                 if attn_mask.dim() == 2:
@@ -160,32 +191,40 @@ class LoRAMultiheadAttention(nn.Module):
                     attn_logits = attn_logits + attn_mask.unsqueeze(0)
                 else:
                     raise ValueError("Unsupported attn_mask dimension")
-    
+
         pad_mask = None
         if key_padding_mask is not None:
             pad_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
             fill_value = torch.finfo(attn_logits.dtype).min
             attn_logits = attn_logits.masked_fill(pad_mask, fill_value)
-    
+
         attn_logits = attn_logits - attn_logits.max(dim=-1, keepdim=True).values
         attn_weights = torch.softmax(attn_logits, dim=-1)
         if pad_mask is not None:
             attn_weights = attn_weights.masked_fill(pad_mask, 0.0)
-            denom = attn_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(attn_weights.dtype).tiny)
+            denom = attn_weights.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(attn_weights.dtype).tiny
+            )
             attn_weights = attn_weights / denom
         attn_weights = torch.dropout(attn_weights, self.dropout_p, self.training)
-    
-        attn_output = torch.matmul(attn_weights, v)                     # (N, heads, L, head_dim)
-        attn_output = attn_output.transpose(1, 2).contiguous().view(N, L, self.embed_dim).permute(1, 0, 2)
+
+        attn_output = torch.matmul(attn_weights, v)  # (N, heads, L, head_dim)
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(N, L, self.embed_dim)
+            .permute(1, 0, 2)
+        )
         attn_output = self.out_proj(attn_output)
-    
+
         if not need_weights:
             return attn_output, None
-    
-        # average heads
-        attn_weights_out = attn_weights.mean(dim=1) if average_attn_weights else attn_weights
-        return attn_output, attn_weights_out
 
+        # average heads
+        attn_weights_out = (
+            attn_weights.mean(dim=1) if average_attn_weights else attn_weights
+        )
+        return attn_output, attn_weights_out
 
 
 def _match_any(name: str, regex_list: Sequence[str]) -> bool:
@@ -194,8 +233,8 @@ def _match_any(name: str, regex_list: Sequence[str]) -> bool:
 
 def _get_parent_module(model: nn.Module, name: str):
     if not name:
-        return None, ''
-    parts = name.split('.')
+        return None, ""
+    parts = name.split(".")
     module = model
     for part in parts[:-1]:
         if part.isdigit() and isinstance(module, (nn.Sequential, nn.ModuleList, list)):
@@ -208,7 +247,7 @@ def _get_parent_module(model: nn.Module, name: str):
 def _get_module(model: nn.Module, name: str) -> nn.Module:
     if not name:
         return model
-    parts = name.split('.')
+    parts = name.split(".")
     module = model
     for part in parts:
         if part.isdigit() and isinstance(module, (nn.Sequential, nn.ModuleList, list)):
@@ -232,7 +271,13 @@ def _collect_named_modules(model: nn.Module) -> List[tuple]:
     return list(model.named_modules())
 
 
-def apply_lora_linear(model: nn.Module, regex_list: Sequence[str], r: int = 8, alpha: int = 32, dropout: float = 0.05) -> None:
+def apply_lora_linear(
+    model: nn.Module,
+    regex_list: Sequence[str],
+    r: int = 8,
+    alpha: int = 32,
+    dropout: float = 0.05,
+) -> None:
     if not regex_list:
         return
     replaced_set = set()
@@ -241,7 +286,9 @@ def apply_lora_linear(model: nn.Module, regex_list: Sequence[str], r: int = 8, a
     if _HAS_PEFT:
         target_modules: List[str] = []
         for name, module in named_modules:
-            if isinstance(module, (nn.Linear, nn.MultiheadAttention)) and _match_any(name, regex_list):
+            if isinstance(module, (nn.Linear, nn.MultiheadAttention)) and _match_any(
+                name, regex_list
+            ):
                 target_modules.append(name)
         if target_modules:
             peft_config = LoraConfig(
@@ -265,7 +312,9 @@ def apply_lora_linear(model: nn.Module, regex_list: Sequence[str], r: int = 8, a
             continue
 
         if isinstance(current_module, nn.MultiheadAttention):
-            lora_module = LoRAMultiheadAttention(current_module, r=r, alpha=alpha, dropout=dropout)
+            lora_module = LoRAMultiheadAttention(
+                current_module, r=r, alpha=alpha, dropout=dropout
+            )
             _set_module(model, name, lora_module)
             replaced_set.add(name)
             continue
@@ -284,12 +333,18 @@ def apply_lora_linear(model: nn.Module, regex_list: Sequence[str], r: int = 8, a
         print("  ...")
 
 
-def apply_conv_lora_1x1(model: nn.Module, regex_list: Sequence[str], r: int = 4, alpha: int = 32) -> None:
+def apply_conv_lora_1x1(
+    model: nn.Module, regex_list: Sequence[str], r: int = 4, alpha: int = 32
+) -> None:
     if not regex_list:
         return
     replaced_set = set()
     for name, module in _collect_named_modules(model):
-        if isinstance(module, nn.Conv2d) and module.kernel_size == (1, 1) and _match_any(name, regex_list):
+        if (
+            isinstance(module, nn.Conv2d)
+            and module.kernel_size == (1, 1)
+            and _match_any(name, regex_list)
+        ):
             lora_module = ConvLoRA1x1(module, r=r, alpha=alpha)
             _set_module(model, name, lora_module)
             replaced_set.add(name)
@@ -301,18 +356,20 @@ def apply_conv_lora_1x1(model: nn.Module, regex_list: Sequence[str], r: int = 4,
         print("  ...")
 
 
-def freeze_all_but_lora_and_heads(model: nn.Module, keep_keywords: Iterable[str] = ()):  # noqa: D401
+def freeze_all_but_lora_and_heads(
+    model: nn.Module, keep_keywords: Iterable[str] = ()
+):  # noqa: D401
     for param in model.parameters():
         param.requires_grad_(False)
 
     for module in model.modules():
         if isinstance(module, LoRALinear):
             for name, param in module.named_parameters():
-                if name.startswith('A') or name.startswith('B'):
+                if name.startswith("A") or name.startswith("B"):
                     param.requires_grad_(True)
         elif isinstance(module, ConvLoRA1x1):
             for name, param in module.named_parameters():
-                if name.startswith('A') or name.startswith('B'):
+                if name.startswith("A") or name.startswith("B"):
                     param.requires_grad_(True)
 
     keep_keywords = tuple(keep_keywords or ())
@@ -324,16 +381,18 @@ def freeze_all_but_lora_and_heads(model: nn.Module, keep_keywords: Iterable[str]
 
 def report_trainable(model: nn.Module) -> None:
     total = sum(param.numel() for param in model.parameters())
-    trainable = sum(param.numel() for param in model.parameters() if param.requires_grad)
+    trainable = sum(
+        param.numel() for param in model.parameters() if param.requires_grad
+    )
     pct = 100.0 * trainable / max(1, total)
     print(f"[LoRA] Trainable params: {trainable}/{total} ({pct:.2f}%)")
 
 
 __all__ = [
-    'LoRALinear',
-    'ConvLoRA1x1',
-    'apply_lora_linear',
-    'apply_conv_lora_1x1',
-    'freeze_all_but_lora_and_heads',
-    'report_trainable',
+    "LoRALinear",
+    "ConvLoRA1x1",
+    "apply_lora_linear",
+    "apply_conv_lora_1x1",
+    "freeze_all_but_lora_and_heads",
+    "report_trainable",
 ]
