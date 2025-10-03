@@ -195,6 +195,8 @@ class LQVG(nn.Module):
         # Follow Deformable-DETR, we use the last three stages outputs from backbone
         for l, (feat, pos_l) in enumerate(zip(features[-3:], pos[-3:])):
             src, mask = feat.decompose()
+            if self.use_mmca_conv:
+                src = self.mmca_conv[l](src, text_word_features_raw)
             src_proj_l = self.input_proj[l](src)
             if self.use_mmca_conv:
                 src_proj_l = self.mmca_conv[l](src_proj_l, text_word_features_raw_conv)
