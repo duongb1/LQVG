@@ -286,9 +286,8 @@ def apply_lora_linear(
     if _HAS_PEFT:
         target_modules: List[str] = []
         for name, module in named_modules:
-            if isinstance(module, (nn.Linear, nn.MultiheadAttention)) and _match_any(
-                name, regex_list
-            ):
+            # CHỈ Linear cho PEFT (loại bỏ MultiheadAttention ở đây)
+            if isinstance(module, nn.Linear) and _match_any(name, regex_list):
                 target_modules.append(name)
         if target_modules:
             peft_config = LoraConfig(
@@ -300,6 +299,7 @@ def apply_lora_linear(
             )
             get_peft_model(model, peft_config)
             replaced_set.update(target_modules)
+
 
     # Manual fallback or additional wrapping for fine-grained control
     for name, module in named_modules:
