@@ -16,12 +16,12 @@ TEXT_LORA_PATTERNS = [
 ]
 
 FUSION_LORA_PATTERNS = [
-    r"^fusion_module\.multihead_attn\.out_proj$",
-    r"^fusion_module_text\.multihead_attn\.out_proj$",
+    r"^fusion_module\.multihead_attn$",
+    r"^fusion_module_text\.multihead_attn$",
 ]
 
 DECODER_LORA_PATTERNS = [
-    r"^transformer\.decoder\.layers\.\d+\.self_attn\.out_proj$",
+    r"^transformer\.decoder\.layers\.\d+\.self_attn$",
     r"^transformer\.decoder\.layers\.\d+\.linear1$",
     r"^transformer\.decoder\.layers\.\d+\.linear2$",
 ]
