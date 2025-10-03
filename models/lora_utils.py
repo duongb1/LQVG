@@ -113,12 +113,20 @@ class LoRAMultiheadAttention(nn.Module):
 
     def forward(self,
                 query: torch.Tensor,
-                key: torch.Tensor,
-                value: torch.Tensor,
-                attn_mask: Optional[torch.Tensor] = None,
+                key: Optional[torch.Tensor] = None,
+                value: Optional[torch.Tensor] = None,
                 key_padding_mask: Optional[torch.Tensor] = None,
                 need_weights: bool = False,
-                average_attn_weights: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+                attn_mask: Optional[torch.Tensor] = None,
+                average_attn_weights: bool = True,
+                is_causal: bool = False,
+                **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        del is_causal, kwargs  # Unused but kept for signature parity
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+
         q = self.q_proj(query)
         k = self.k_proj(key)
         v = self.v_proj(value)
