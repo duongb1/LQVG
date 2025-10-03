@@ -112,7 +112,7 @@ class LoRAMultiheadAttention(nn.Module):
         return x.permute(1, 0, 2)
 
     def forward(self,
-                query: torch.Tensor,
+                query: torch.Tensor = None,
                 key: Optional[torch.Tensor] = None,
                 value: Optional[torch.Tensor] = None,
                 key_padding_mask: Optional[torch.Tensor] = None,
@@ -120,24 +120,29 @@ class LoRAMultiheadAttention(nn.Module):
                 attn_mask: Optional[torch.Tensor] = None,
                 average_attn_weights: bool = True,
                 is_causal: bool = False,
-                **kwargs) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        del is_causal, kwargs  # Unused but kept for signature parity
+                # --- compatibility with legacy fusion wrappers expecting x ---
+                x: torch.Tensor = None,
+                **kwargs):
+        # map legacy signature (x, key, value, ...) -> (query, key, value, ...)
+        if query is None and x is not None:
+            query = x
         if key is None:
             key = query
         if value is None:
             value = key
-
+    
         q = self.q_proj(query)
         k = self.k_proj(key)
         v = self.v_proj(value)
-
+    
         scaling = float(self.head_dim) ** -0.5
-        q = self._reshape(q) * scaling
-        k = self._reshape(k)
-        v = self._reshape(v)
-
+        L, N, _ = q.shape
+        q = q.permute(1, 0, 2).contiguous().view(N, L, self.num_heads, self.head_dim).transpose(1, 2) * scaling
+        k = k.permute(1, 0, 2).contiguous().view(N, L, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.permute(1, 0, 2).contiguous().view(N, L, self.num_heads, self.head_dim).transpose(1, 2)
+    
         attn_logits = torch.matmul(q, k.transpose(-2, -1))
-
+    
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
                 if attn_mask.dim() == 2:
@@ -155,34 +160,32 @@ class LoRAMultiheadAttention(nn.Module):
                     attn_logits = attn_logits + attn_mask.unsqueeze(0)
                 else:
                     raise ValueError("Unsupported attn_mask dimension")
-
-        mask = None
+    
+        pad_mask = None
         if key_padding_mask is not None:
-            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            pad_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
             fill_value = torch.finfo(attn_logits.dtype).min
-            attn_logits = attn_logits.masked_fill(mask, fill_value)
-
+            attn_logits = attn_logits.masked_fill(pad_mask, fill_value)
+    
         attn_logits = attn_logits - attn_logits.max(dim=-1, keepdim=True).values
         attn_weights = torch.softmax(attn_logits, dim=-1)
-        if mask is not None:
-            attn_weights = attn_weights.masked_fill(mask, 0.0)
+        if pad_mask is not None:
+            attn_weights = attn_weights.masked_fill(pad_mask, 0.0)
             denom = attn_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(attn_weights.dtype).tiny)
             attn_weights = attn_weights / denom
         attn_weights = torch.dropout(attn_weights, self.dropout_p, self.training)
-
-        attn_output = torch.matmul(attn_weights, v)
-        attn_output = self._merge(attn_output)
+    
+        attn_output = torch.matmul(attn_weights, v)                     # (N, heads, L, head_dim)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(N, L, self.embed_dim).permute(1, 0, 2)
         attn_output = self.out_proj(attn_output)
-
+    
         if not need_weights:
             return attn_output, None
-
-        if average_attn_weights:
-            attn_weights_out = attn_weights.mean(dim=1)
-        else:
-            attn_weights_out = attn_weights
-
+    
+        # average heads
+        attn_weights_out = attn_weights.mean(dim=1) if average_attn_weights else attn_weights
         return attn_output, attn_weights_out
+
 
 
 def _match_any(name: str, regex_list: Sequence[str]) -> bool:
