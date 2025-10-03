@@ -130,11 +130,11 @@ class LQVG(nn.Module):
         self.mmca_conv = nn.ModuleList([
             MM_adaption_conv_2d(
                 d_model=hidden_dim,
-                d_model_visual=last3_channels[i],
+                d_model_visual=hidden_dim,
                 down_rate=4,
                 d_text=hidden_dim,
             )
-            for i in range(len(last3_channels))
+            for _ in range(len(last3_channels))
         ])
 
         self.mmca_lin_vis = nn.ModuleList([
@@ -147,12 +147,7 @@ class LQVG(nn.Module):
             for _ in range(len(last3_channels))
         ])
 
-        self.mmca_lin_txt = MM_adaption_linear(
-            d_model=hidden_dim,
-            d_model_visual=hidden_dim,
-            down_rate=4,
-            d_text=hidden_dim,
-        )
+        self.mmca_lin_txt = None
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -188,7 +183,11 @@ class LQVG(nn.Module):
 
         text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
         text_word_features, text_word_masks = text_features.decompose()
-        text_word_features_raw = text_word_features
+        text_word_features_raw = text_word_features.clone()
+        if t > 1:
+            text_word_features_raw_conv = text_word_features_raw.repeat_interleave(t, dim=0)
+        else:
+            text_word_features_raw_conv = text_word_features_raw
 
         text_word_features = text_word_features.permute(1, 0, 2)  # [length, batch_size, c]
         text_word_initial_features = text_word_features
@@ -199,6 +198,8 @@ class LQVG(nn.Module):
             if self.use_mmca_conv:
                 src = self.mmca_conv[l](src, text_word_features_raw)
             src_proj_l = self.input_proj[l](src)
+            if self.use_mmca_conv:
+                src_proj_l = self.mmca_conv[l](src_proj_l, text_word_features_raw_conv)
             n, c, h, w = src_proj_l.shape
 
             # vision language early-fusion
@@ -211,17 +212,12 @@ class LQVG(nn.Module):
                 flat_vis_bf = self.mmca_lin_vis[l](flat_vis_bf, text_word_features_raw)
                 src_proj_l = rearrange(flat_vis_bf, 'b l c -> l b c')
 
-                txt_bf = rearrange(text_word_features, 'l b c -> b l c')
-                txt_bf = self.mmca_lin_txt(txt_bf, flat_vis_bf)
-                text_word_features = rearrange(txt_bf, 'b l c -> l b c')
-
             text_word_features = self.fusion_module_text(tgt=text_word_features,
                                                          memory=src_proj_l,
                                                          memory_key_padding_mask=mask,
                                                          pos=pos_l,
                                                          query_pos=None)
 
-            text_word_features_raw = rearrange(text_word_features, 'l b c -> b l c')
 
             src_proj_l = self.fusion_module(tgt=src_proj_l,
                                             memory=text_word_initial_features,

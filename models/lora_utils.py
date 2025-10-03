@@ -1,5 +1,5 @@
 import re
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -58,6 +58,115 @@ class ConvLoRA1x1(nn.Module):
         return self.conv(x) + self.B(self.A(x)) * self.scaling
 
 
+class LoRAMultiheadAttention(nn.Module):
+    def __init__(self, attn: nn.MultiheadAttention, r: int = 8, alpha: int = 32, dropout: float = 0.05):
+        super().__init__()
+        if attn.batch_first:
+            raise ValueError("LoRAMultiheadAttention does not currently support batch_first=True")
+        if attn.bias_k is not None or attn.bias_v is not None:
+            raise ValueError("LoRAMultiheadAttention does not support bias_k or bias_v")
+
+        self.embed_dim = attn.embed_dim
+        self.num_heads = attn.num_heads
+        if self.embed_dim % self.num_heads != 0:
+            raise ValueError("embed_dim must be divisible by num_heads")
+        self.head_dim = self.embed_dim // self.num_heads
+        self.dropout_p = attn.dropout
+
+        in_proj_bias = attn.in_proj_bias is not None
+        weight = attn.in_proj_weight.detach()
+        bias = attn.in_proj_bias.detach() if in_proj_bias else None
+
+        q_linear = nn.Linear(self.embed_dim, self.embed_dim, bias=in_proj_bias)
+        k_linear = nn.Linear(self.embed_dim, self.embed_dim, bias=in_proj_bias)
+        v_linear = nn.Linear(self.embed_dim, self.embed_dim, bias=in_proj_bias)
+
+        q_linear.weight.data.copy_(weight[:self.embed_dim])
+        k_linear.weight.data.copy_(weight[self.embed_dim:2 * self.embed_dim])
+        v_linear.weight.data.copy_(weight[2 * self.embed_dim:])
+        if in_proj_bias:
+            q_linear.bias.data.copy_(bias[:self.embed_dim])
+            k_linear.bias.data.copy_(bias[self.embed_dim:2 * self.embed_dim])
+            v_linear.bias.data.copy_(bias[2 * self.embed_dim:])
+
+        out_linear = nn.Linear(self.embed_dim, self.embed_dim, bias=attn.out_proj.bias is not None)
+        out_linear.weight.data.copy_(attn.out_proj.weight.detach())
+        if attn.out_proj.bias is not None:
+            out_linear.bias.data.copy_(attn.out_proj.bias.detach())
+
+        self.q_proj = LoRALinear(q_linear, r=r, alpha=alpha, dropout=dropout)
+        self.k_proj = LoRALinear(k_linear, r=r, alpha=alpha, dropout=dropout)
+        self.v_proj = LoRALinear(v_linear, r=r, alpha=alpha, dropout=dropout)
+        self.out_proj = LoRALinear(out_linear, r=r, alpha=alpha, dropout=dropout)
+
+    def _reshape(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (L, N, C) -> (N, heads, L, head_dim)
+        L, N, _ = x.shape
+        x = x.permute(1, 0, 2).contiguous().view(N, L, self.num_heads, self.head_dim)
+        return x.transpose(1, 2)
+
+    def _merge(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, heads, L, head_dim) -> (L, N, C)
+        N, _, L, _ = x.shape
+        x = x.transpose(1, 2).contiguous().view(N, L, self.embed_dim)
+        return x.permute(1, 0, 2)
+
+    def forward(self,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                attn_mask: Optional[torch.Tensor] = None,
+                key_padding_mask: Optional[torch.Tensor] = None,
+                need_weights: bool = False,
+                average_attn_weights: bool = True) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+
+        scaling = float(self.head_dim) ** -0.5
+        q = self._reshape(q) * scaling
+        k = self._reshape(k)
+        v = self._reshape(v)
+
+        attn_logits = torch.matmul(q, k.transpose(-2, -1))
+
+        if attn_mask is not None:
+            if attn_mask.dim() == 2:
+                attn_logits += attn_mask.unsqueeze(0).unsqueeze(0)
+            elif attn_mask.dim() == 3:
+                attn_logits += attn_mask.unsqueeze(0)
+            else:
+                raise ValueError("Unsupported attn_mask dimension")
+
+        mask = None
+        if key_padding_mask is not None:
+            mask = key_padding_mask.unsqueeze(1).unsqueeze(2)
+            fill_value = torch.finfo(attn_logits.dtype).min
+            attn_logits = attn_logits.masked_fill(mask, fill_value)
+
+        attn_logits = attn_logits - attn_logits.max(dim=-1, keepdim=True).values
+        attn_weights = torch.softmax(attn_logits, dim=-1)
+        if mask is not None:
+            attn_weights = attn_weights.masked_fill(mask, 0.0)
+            denom = attn_weights.sum(dim=-1, keepdim=True).clamp_min(torch.finfo(attn_weights.dtype).tiny)
+            attn_weights = attn_weights / denom
+        attn_weights = torch.dropout(attn_weights, self.dropout_p, self.training)
+
+        attn_output = torch.matmul(attn_weights, v)
+        attn_output = self._merge(attn_output)
+        attn_output = self.out_proj(attn_output)
+
+        if not need_weights:
+            return attn_output, None
+
+        if average_attn_weights:
+            attn_weights_out = attn_weights.mean(dim=1)
+        else:
+            attn_weights_out = attn_weights
+
+        return attn_output, attn_weights_out
+
+
 def _match_any(name: str, regex_list: Sequence[str]) -> bool:
     return any(re.match(pattern, name) for pattern in regex_list)
 
@@ -111,7 +220,7 @@ def apply_lora_linear(model: nn.Module, regex_list: Sequence[str], r: int = 8, a
     if _HAS_PEFT:
         target_modules: List[str] = []
         for name, module in named_modules:
-            if isinstance(module, nn.Linear) and _match_any(name, regex_list):
+            if isinstance(module, (nn.Linear, nn.MultiheadAttention)) and _match_any(name, regex_list):
                 target_modules.append(name)
         if target_modules:
             peft_config = LoraConfig(
@@ -126,9 +235,20 @@ def apply_lora_linear(model: nn.Module, regex_list: Sequence[str], r: int = 8, a
 
     # Manual fallback or additional wrapping for fine-grained control
     for name, module in named_modules:
-        if not isinstance(module, nn.Linear) or not _match_any(name, regex_list):
+        if not _match_any(name, regex_list):
             continue
+
         current_module = _get_module(model, name)
+
+        if isinstance(current_module, LoRALinear):
+            continue
+
+        if isinstance(current_module, nn.MultiheadAttention):
+            lora_module = LoRAMultiheadAttention(current_module, r=r, alpha=alpha, dropout=dropout)
+            _set_module(model, name, lora_module)
+            replaced_set.add(name)
+            continue
+
         if not isinstance(current_module, nn.Linear):
             continue
         lora_module = LoRALinear(current_module, r=r, alpha=alpha, dropout=dropout)
