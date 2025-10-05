@@ -21,13 +21,16 @@ from models.ops.modules import MSDeformAttn
 
 from einops import rearrange
 
+from .dqr import DQR
+
 
 class DeformableTransformer(nn.Module):
     def __init__(self, d_model=256, nhead=8,
                  num_encoder_layers=6, num_decoder_layers=6, dim_feedforward=1024, dropout=0.1,
                  activation="relu", return_intermediate_dec=False,
                  num_feature_levels=4, dec_n_points=4,  enc_n_points=4,
-                 two_stage=False, two_stage_num_proposals=300):
+                 two_stage=False, two_stage_num_proposals=300,
+                 use_dqr=True, dqr_alpha=0.2, dqr_beta=0.0, dqr_dropout=0.1):
         super().__init__()
 
         self.d_model = d_model
@@ -36,6 +39,7 @@ class DeformableTransformer(nn.Module):
         self.two_stage = two_stage
         self.two_stage_num_proposals = two_stage_num_proposals
         self.num_feature_level = num_feature_levels
+        self.use_dqr = use_dqr
 
         encoder_layer = DeformableTransformerEncoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
@@ -46,12 +50,23 @@ class DeformableTransformer(nn.Module):
 
         decoder_layer = DeformableTransformerDecoderLayer(d_model, dim_feedforward,
                                                           dropout, activation,
-                                                          num_feature_levels, 
+                                                          num_feature_levels,
                                                           nhead, dec_n_points)
 
-        self.decoder = DeformableTransformerDecoder(decoder_layer, num_decoder_layers, return_intermediate_dec)
+        self.decoder = DeformableTransformerDecoder(
+            decoder_layer,
+            num_decoder_layers,
+            return_intermediate_dec,
+            use_dqr=use_dqr,
+            d_model=d_model,
+            nhead=nhead,
+            dqr_alpha=dqr_alpha,
+            dqr_beta=dqr_beta,
+            dqr_dropout=dqr_dropout,
+        )
 
         self.level_embed = nn.Parameter(torch.Tensor(num_feature_levels, d_model))
+        self.text_proj = None
 
         if two_stage:
             self.enc_output = nn.Linear(d_model, d_model)
@@ -132,7 +147,7 @@ class DeformableTransformer(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, tgt, masks, pos_embeds, query_embed=None):
+    def forward(self, srcs, tgt, masks, pos_embeds, query_embed=None, text_tokens=None):
         assert self.two_stage or query_embed is not None
         """
         srcs (list[Tensor]): list of tensors num_layers x [batch_size*time, c, hi, wi], input of encoder
@@ -189,16 +204,42 @@ class DeformableTransformer(nn.Module):
             init_reference_out = reference_points
             pos_trans_out = self.pos_trans_norm(self.pos_trans(self.get_proposal_pos_embed(topk_coords_unact)))
             query_embed, tgt = torch.split(pos_trans_out, c, dim=2)
+            text_tokens = None
         else:
             b, t, q, c = tgt.shape
             tgt = rearrange(tgt, 'b t q c -> (b t) q c')
             query_embed = query_embed.unsqueeze(0).expand(b*t, -1, -1)      # [batch_size*time, num_queries_per_frame, c]
             reference_points = self.reference_points(query_embed).sigmoid() # [batch_size*time, num_queries_per_frame, 2]
             init_reference_out = reference_points
+            if text_tokens is not None:
+                if text_tokens.dim() != 3:
+                    raise ValueError("text_tokens must be [L,B,C] or [B,L,C]")
+                if text_tokens.shape[0] == b and text_tokens.shape[1] != b:
+                    # [B,L,C]
+                    text_tokens = text_tokens.permute(1, 0, 2)
+                elif text_tokens.shape[1] != b:
+                    raise ValueError("text_tokens must have batch dimension equal to visual batch size")
+                # text_tokens: [L, B, C]
+                if text_tokens.size(-1) != self.d_model:
+                    in_dim = text_tokens.size(-1)
+                    if self.text_proj is None or self.text_proj.in_features != in_dim:
+                        self.text_proj = nn.Linear(in_dim, self.d_model, bias=False).to(text_tokens.device)
+                    text_tokens = self.text_proj(text_tokens)
+                text_tokens = text_tokens.repeat_interleave(t, dim=1)
+                text_tokens = text_tokens.to(tgt.dtype)
 
         # decoder
-        hs, inter_references, inter_samples = self.decoder(tgt, reference_points, memory,
-                                            spatial_shapes, level_start_index, valid_ratios, query_embed, mask_flatten)
+        hs, inter_references, inter_samples = self.decoder(
+            tgt,
+            reference_points,
+            memory,
+            spatial_shapes,
+            level_start_index,
+            valid_ratios,
+            query_embed,
+            mask_flatten,
+            text_tokens=text_tokens,
+        )
 
         inter_references_out = inter_references
 
@@ -411,7 +452,8 @@ class DeformableTransformerDecoderLayer(nn.Module):
 
 
 class DeformableTransformerDecoder(nn.Module):
-    def __init__(self, decoder_layer, num_layers, return_intermediate=False):
+    def __init__(self, decoder_layer, num_layers, return_intermediate=False,
+                 use_dqr=False, d_model=256, nhead=8, dqr_alpha=0.2, dqr_beta=0.2, dqr_dropout=0.1):
         super().__init__()
         self.layers = _get_clones(decoder_layer, num_layers)
         # self.query_encoder_layers = _get_clones(query_encoder_layers, num_query_layers)
@@ -422,10 +464,14 @@ class DeformableTransformerDecoder(nn.Module):
         self.bbox_embed = None
         self.class_embed = None
 
+        self.dqr = DQR(d_model=d_model, nhead=nhead,
+                       attn_dropout=dqr_dropout,
+                       alpha=dqr_alpha, beta=dqr_beta) if use_dqr else None
+
     def forward(self, tgt, reference_points, src, src_spatial_shapes, src_level_start_index, src_valid_ratios,
-                query_pos=None, src_padding_mask=None):
+                query_pos=None, src_padding_mask=None, text_tokens=None):
         # we modify here for get the information of sample points
-        output = tgt 
+        output = tgt
 
         intermediate = []
         intermediate_reference_points = []
@@ -437,10 +483,16 @@ class DeformableTransformerDecoder(nn.Module):
             else:
                 assert reference_points.shape[-1] == 2
                 reference_points_input = reference_points[:, :, None] * src_valid_ratios[:, None]
-            output, sampling_locations, attention_weights = layer(output, query_pos, reference_points_input, 
+            output, sampling_locations, attention_weights = layer(output, query_pos, reference_points_input,
                                                         src, src_spatial_shapes, src_level_start_index, src_padding_mask)
 
-            # sampling_loactions: [N, Len_q, self.n_heads, self.n_levels, self.n_points, 2], 
+            if self.dqr is not None and text_tokens is not None:
+                q = output.transpose(0, 1)  # [Q, B, C]
+                vmem = src.transpose(1, 0)  # [HW, B, C]
+                q = self.dqr(q, text_tokens, vmem)
+                output = q.transpose(0, 1)
+
+            # sampling_loactions: [N, Len_q, self.n_heads, self.n_levels, self.n_points, 2],
             #                     [B, Q, n_head, n_level(num_feature_level*num_frames), n_points, 2]
             # attention_weights: [B, Q, n_head, n_level(num_feature_level*num_frames), n_points]
             # src_valid_ratios: [N, self.n_levels, 2]
@@ -505,4 +557,9 @@ def build_deforamble_transformer(args):
         dec_n_points=args.dec_n_points,
         enc_n_points=args.enc_n_points,
         two_stage=args.two_stage,
-        two_stage_num_proposals=args.num_queries)
+        two_stage_num_proposals=args.num_queries,
+        use_dqr=getattr(args, "use_dqr", True),
+        dqr_alpha=getattr(args, "dqr_alpha", 0.2),
+        dqr_beta=getattr(args, "dqr_beta", 0.0),
+        dqr_dropout=getattr(args, "dqr_dropout", 0.1),
+    )

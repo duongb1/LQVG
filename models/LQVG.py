@@ -227,13 +227,14 @@ class LQVG(nn.Module):
                 poses.append(pos_l)
 
         text_word_features = rearrange(text_word_features, 'l b c -> b l c')
+        text_tokens = text_word_features.permute(1, 0, 2).contiguous()
         text_sentence_features = self.poolout_module(text_word_features)
 
         # Transformer
         query_embeds = self.query_embed.weight  # [num_queries, c]
         text_embed = repeat(text_sentence_features, 'b c -> b t q c', t=t, q=self.num_queries)
         hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, inter_samples = \
-            self.transformer(srcs, text_embed, masks, poses, query_embeds)
+            self.transformer(srcs, text_embed, masks, poses, query_embeds, text_tokens=text_tokens)
 
 
         out = {}
