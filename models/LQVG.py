@@ -14,7 +14,6 @@ from .position_encoding import PositionEmbeddingSine1D
 from .backbone import build_backbone
 from .deformable_transformer import build_deforamble_transformer
 from .segmentation import VisionLanguageFusionModule
-from .text_guide_linear import MM_adaption_conv_2d, MM_adaption_linear
 from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
@@ -123,32 +122,6 @@ class LQVG(nn.Module):
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
 
-        self.use_mmca_conv = True
-        self.use_mmca_lin = True
-
-        last3_channels = backbone.num_channels[-3:]
-        self.mmca_conv = nn.ModuleList([
-            MM_adaption_conv_2d(
-                d_model=hidden_dim,
-                d_model_visual=hidden_dim,
-                down_rate=4,
-                d_text=hidden_dim,
-            )
-            for _ in range(len(last3_channels))
-        ])
-
-        self.mmca_lin_vis = nn.ModuleList([
-            MM_adaption_linear(
-                d_model=hidden_dim,
-                d_model_visual=hidden_dim,
-                down_rate=4,
-                d_text=hidden_dim,
-            )
-            for _ in range(len(last3_channels))
-        ])
-
-        self.mmca_lin_txt = None
-
     def forward(self, samples: NestedTensor, captions, targets):
 
         # Backbone
@@ -183,34 +156,19 @@ class LQVG(nn.Module):
 
         text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
         text_word_features, text_word_masks = text_features.decompose()
-        text_word_features_raw = text_word_features.clone()
-        if t > 1:
-            text_word_features_raw_conv = text_word_features_raw.repeat_interleave(t, dim=0)
-        else:
-            text_word_features_raw_conv = text_word_features_raw
-
         text_word_features = text_word_features.permute(1, 0, 2)  # [length, batch_size, c]
         text_word_initial_features = text_word_features
 
         # Follow Deformable-DETR, we use the last three stages outputs from backbone
         for l, (feat, pos_l) in enumerate(zip(features[-3:], pos[-3:])):
             src, mask = feat.decompose()
-            if self.use_mmca_conv:
-                src = self.mmca_conv[l](src, text_word_features_raw)
             src_proj_l = self.input_proj[l](src)
-            if self.use_mmca_conv:
-                src_proj_l = self.mmca_conv[l](src_proj_l, text_word_features_raw_conv)
             n, c, h, w = src_proj_l.shape
 
             # vision language early-fusion
             src_proj_l = rearrange(src_proj_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
             mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
             pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
-
-            if self.use_mmca_lin:
-                flat_vis_bf = rearrange(src_proj_l, 'l b c -> b l c')
-                flat_vis_bf = self.mmca_lin_vis[l](flat_vis_bf, text_word_features_raw)
-                src_proj_l = rearrange(flat_vis_bf, 'b l c -> l b c')
 
             text_word_features = self.fusion_module_text(tgt=text_word_features,
                                                          memory=src_proj_l,
