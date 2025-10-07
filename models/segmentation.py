@@ -408,32 +408,52 @@ class VisionLanguageBlock(nn.Module):
 
 
 class VisionLanguageFusionModule(nn.Module):
-    def __init__(self, d_model, nhead, dropout=0.1):
+    """
+    Fusion block (drop-in):
+      - Pre-norm: LN -> MHA -> residual
+      - Pre-norm: LN -> FFN -> residual
+      - FFN: d -> 4d -> d
+      - API giữ nguyên: forward(tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None)
+      - Kỳ vọng cải thiện hơn bản chỉ MHA+LN.
+    """
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1, ffn_mult: int = 4):
         super().__init__()
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.norm = nn.LayerNorm(d_model)
-        self.dropout = nn.Dropout(dropout)
+        # PyTorch MHA: [L, B, C] nếu batch_first=False (mặc định)
+        self.mha = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_mult * d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(ffn_mult * d_model, d_model),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
 
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        return tensor if pos is None else tensor + pos
+    @staticmethod
+    def _with_pos(x: Tensor, pos: Optional[Tensor]) -> Tensor:
+        return x if pos is None else x + pos
 
-    def forward(self, tgt, memory,
-                memory_key_padding_mask: Optional[Tensor] = None,
-                pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
-        # Pre-LN for stable stacking
-        tgt2 = self.norm(tgt)
-        attn_out = self.multihead_attn(
-            query=self.with_pos_embed(tgt2, query_pos),
-            key=self.with_pos_embed(memory, pos),
-            value=memory,
-            attn_mask=None,
-            key_padding_mask=memory_key_padding_mask
-        )[0]
-        # Residual fusion with dropout
-        tgt = tgt + self.dropout(attn_out)
-        return tgt
+    def forward(
+        self,
+        tgt: Tensor,                      # [Lq, B, C]
+        memory: Tensor,                   # [Lk, B, C]
+        memory_key_padding_mask: Optional[Tensor] = None,  # [B, Lk] True=mask
+        pos: Optional[Tensor] = None,     # [Lk, B, C]
+        query_pos: Optional[Tensor] = None  # [Lq, B, C]
+    ) -> Tensor:
+        # --- MHA block (pre-norm) ---
+        x = self.norm1(tgt)
+        q = self._with_pos(x, query_pos)
+        k = self._with_pos(memory, pos)
+        v = memory
+        attn_out = self.mha(q, k, v, key_padding_mask=memory_key_padding_mask)[0]
+        x = tgt + self.drop(attn_out)
 
+        # --- FFN block (pre-norm) ---
+        y = self.norm2(x)
+        y = self.ffn(y)
+        x = x + self.drop(y)
+        return x
 
 
 def dice_loss(inputs, targets, num_boxes):
