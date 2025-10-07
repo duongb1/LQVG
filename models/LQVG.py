@@ -28,7 +28,7 @@ def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"  # this disables a huggingface tokenizer warning (printed every epoch)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"  # disable HF tokenizer warning
 
 
 class LQVG(nn.Module):
@@ -57,7 +57,7 @@ class LQVG(nn.Module):
                     nn.Conv2d(in_channels, hidden_dim, kernel_size=1),
                     nn.GroupNorm(32, hidden_dim),
                 ))
-            for _ in range(num_feature_levels - num_backbone_outs):  # downsample 2x
+            for _ in range(num_feature_levels - num_backbone_outs):
                 input_proj_list.append(nn.Sequential(
                     nn.Conv2d(in_channels, hidden_dim, kernel_size=3, stride=2, padding=1),
                     nn.GroupNorm(32, hidden_dim),
@@ -92,7 +92,6 @@ class LQVG(nn.Module):
             self.class_embed = _get_clones(self.class_embed, num_pred)
             self.bbox_embed = _get_clones(self.bbox_embed, num_pred)
             nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
-            # hack implementation for iterative bounding box refinement
             self.transformer.decoder.bbox_embed = self.bbox_embed
         else:
             nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
@@ -100,24 +99,32 @@ class LQVG(nn.Module):
             self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(num_pred)])
             self.transformer.decoder.bbox_embed = None
 
-        # self.tokenizer = RobertaTokenizerFast.from_pretrained('./weights/tokenizer')
-        # self.text_encoder = RobertaModel.from_pretrained('./weights/text_encoder')
+        # text encoder
         self.tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
         self.text_encoder = RobertaModel.from_pretrained('roberta-base')
-
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
                 p.requires_grad_(False)
 
-        # resize the bert output channel to transformer d_model
+        # resize bert output to hidden_dim
         self.resizer = FeatureResizer(
             input_feat_size=768,
             output_feat_size=hidden_dim,
             dropout=0.1,
         )
 
+        # === Fusion modules ===
         self.fusion_module = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
         self.fusion_module_text = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
+
+        # === Progressive 3-layer VLI stack ===
+        self.vli_layers = nn.ModuleList([
+            self.fusion_module,
+            VisionLanguageFusionModule(d_model=hidden_dim, nhead=8),
+            VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
+        ])
+        self.vli_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(3)])
+        self.vli_res_scale = 0.7
 
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
@@ -127,9 +134,6 @@ class LQVG(nn.Module):
         # Backbone
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_videos_list(samples)
-
-        # features (list[NestedTensor]): res2 -> res5, shape of tensors is [B*T, Ci, Hi, Wi]
-        # pos (list[Tensor]): shape of [B*T, C, Hi, Wi]
         features, pos = self.backbone(samples)
 
         b = len(captions)
@@ -144,43 +148,48 @@ class LQVG(nn.Module):
             for i, p in enumerate(pos):
                 pos[i] = p.index_select(0, valid_indices)
             samples.mask = samples.mask.index_select(0, valid_indices)
-            # t: num_frames -> 1
             t = 1
 
         text_features = self.forward_text(captions, device=pos[0].device)
 
-        # prepare vision and text features for transformer
-        srcs = []
-        masks = []
-        poses = []
-
-        text_pos = self.text_pos(text_features).permute(2, 0, 1)  # [length, batch_size, c]
+        srcs, masks, poses = [], [], []
+        text_pos = self.text_pos(text_features).permute(2, 0, 1)
         text_word_features, text_word_masks = text_features.decompose()
-
-        text_word_features = text_word_features.permute(1, 0, 2)  # [length, batch_size, c]
+        text_word_features = text_word_features.permute(1, 0, 2)
         text_word_initial_features = text_word_features
 
-        # Follow Deformable-DETR, we use the last three stages outputs from backbone
+        # === multi-scale features ===
         for l, (feat, pos_l) in enumerate(zip(features[-3:], pos[-3:])):
             src, mask = feat.decompose()
             src_proj_l = self.input_proj[l](src)
             n, c, h, w = src_proj_l.shape
 
-            # vision language early-fusion
             src_proj_l = rearrange(src_proj_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
             mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
             pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
-            text_word_features = self.fusion_module_text(tgt=text_word_features,
-                                                         memory=src_proj_l,
-                                                         memory_key_padding_mask=mask,
-                                                         pos=pos_l,
-                                                         query_pos=None)
 
-            src_proj_l = self.fusion_module(tgt=src_proj_l,
-                                            memory=text_word_initial_features,
-                                            memory_key_padding_mask=text_word_masks,
-                                            pos=text_pos,
-                                            query_pos=None)
+            # LVI
+            text_word_features = self.fusion_module_text(
+                tgt=text_word_features,
+                memory=src_proj_l,
+                memory_key_padding_mask=mask,
+                pos=pos_l,
+                query_pos=None)
+
+            # === Progressive 3-layer VLI ===
+            v_cur = src_proj_l
+            for i in range(3):
+                v_in = v_cur
+                v_out = self.vli_layers[i](
+                    tgt=self.vli_norms[i](v_in),
+                    memory=text_word_initial_features,
+                    memory_key_padding_mask=text_word_masks,
+                    pos=text_pos,
+                    query_pos=None
+                )
+                v_cur = v_in + self.vli_res_scale * v_out
+            src_proj_l = v_cur
+
             src_proj_l = rearrange(src_proj_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
             mask = rearrange(mask, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
             pos_l = rearrange(pos_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
@@ -188,10 +197,10 @@ class LQVG(nn.Module):
             srcs.append(src_proj_l)
             masks.append(mask)
             poses.append(pos_l)
-            assert mask is not None
 
+        # === FPN extra levels ===
         if self.num_feature_levels > (len(features) - 1):
-            _len_srcs = len(features) - 1  # fpn level
+            _len_srcs = len(features) - 1
             for l in range(_len_srcs, self.num_feature_levels):
                 if l == _len_srcs:
                     src = self.input_proj[l](features[-1].tensors)
@@ -202,22 +211,31 @@ class LQVG(nn.Module):
                 pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
                 n, c, h, w = src.shape
 
-                # vision language early-fusion
                 src = rearrange(src, '(b t) c h w -> (t h w) b c', b=b, t=t)
                 mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
                 pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
 
-                text_word_features = self.fusion_module_text(tgt=text_word_features,
-                                                             memory=src,
-                                                             memory_key_padding_mask=mask,
-                                                             pos=pos_l,
-                                                             query_pos=None)
-                src = self.fusion_module(tgt=src,
-                                         memory=text_word_initial_features,
-                                         memory_key_padding_mask=text_word_masks,
-                                         pos=text_pos,
-                                         query_pos=None
-                                         )
+                text_word_features = self.fusion_module_text(
+                    tgt=text_word_features,
+                    memory=src,
+                    memory_key_padding_mask=mask,
+                    pos=pos_l,
+                    query_pos=None)
+
+                # === Progressive 3-layer VLI again ===
+                v_cur = src
+                for i in range(3):
+                    v_in = v_cur
+                    v_out = self.vli_layers[i](
+                        tgt=self.vli_norms[i](v_in),
+                        memory=text_word_initial_features,
+                        memory_key_padding_mask=text_word_masks,
+                        pos=text_pos,
+                        query_pos=None
+                    )
+                    v_cur = v_in + self.vli_res_scale * v_out
+                src = v_cur
+
                 src = rearrange(src, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
                 mask = rearrange(mask, 'b (t h w) -> (b t) h w', t=t, h=h, w=w)
                 pos_l = rearrange(pos_l, '(t h w) b c -> (b t) c h w', t=t, h=h, w=w)
@@ -230,50 +248,39 @@ class LQVG(nn.Module):
         text_sentence_features = self.poolout_module(text_word_features)
 
         # Transformer
-        query_embeds = self.query_embed.weight  # [num_queries, c]
+        query_embeds = self.query_embed.weight
         text_embed = repeat(text_sentence_features, 'b c -> b t q c', t=t, q=self.num_queries)
         hs, memory, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact, inter_samples = \
             self.transformer(srcs, text_embed, masks, poses, query_embeds)
 
-
         out = {}
-        # prediction
-        outputs_classes = []
-        outputs_coords = []
+        outputs_classes, outputs_coords = [], []
         for lvl in range(hs.shape[0]):
-            if lvl == 0:
-                reference = init_reference
-            else:
-                reference = inter_references[lvl - 1]
+            reference = init_reference if lvl == 0 else inter_references[lvl - 1]
             reference = inverse_sigmoid(reference)
             outputs_class = self.class_embed[lvl](hs[lvl])
             tmp = self.bbox_embed[lvl](hs[lvl])
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
-                assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
-            outputs_coord = tmp.sigmoid()  # cxcywh, range in [0,1]
+            outputs_coord = tmp.sigmoid()
             outputs_classes.append(outputs_class)
             outputs_coords.append(outputs_coord)
+
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
-        # rearrange
         outputs_class = rearrange(outputs_class, 'l (b t) q k -> l b t q k', b=b, t=t)
         outputs_coord = rearrange(outputs_coord, 'l (b t) q n -> l b t q n', b=b, t=t)
-        out['pred_logits'] = outputs_class[-1]  # [batch_size, time, num_queries_per_frame, num_classes]
-        out['pred_boxes'] = outputs_coord[-1]  # [batch_size, time, num_queries_per_frame, 4]
+        out['pred_logits'] = outputs_class[-1]
+        out['pred_boxes'] = outputs_coord[-1]
 
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
-
         return out
 
     @torch.jit.unused
     def _set_aux_loss(self, outputs_class, outputs_coord):
-        # this is a workaround to make torchscript happy, as torchscript
-        # doesn't support dictionary with non-homogeneous values, such
-        # as a dict having both a Tensor and a list.
         return [{"pred_logits": a, "pred_boxes": b}
                 for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
@@ -286,15 +293,13 @@ class LQVG(nn.Module):
             text_features = encoded_text.last_hidden_state
             text_features = self.resizer(text_features)
             text_masks = text_attention_mask
-            text_features = NestedTensor(text_features, text_masks)  # NestedTensor
+            text_features = NestedTensor(text_features, text_masks)
         else:
-            raise ValueError("Please mask sure the caption is a list of string")
+            raise ValueError("Please make sure caption is list[str]")
         return text_features
 
 
 class MLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
         self.num_layers = num_layers
@@ -314,8 +319,6 @@ class RobertaPoolout(nn.Module):
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # We "pool" the model by simply taking the hidden state corresponding
-        # to the first token.
         first_token_tensor = hidden_states[:, 0]
         pooled_output = self.dense(first_token_tensor)
         pooled_output = self.activation(pooled_output)
@@ -323,15 +326,9 @@ class RobertaPoolout(nn.Module):
 
 
 class FeatureResizer(nn.Module):
-    """
-    This class takes as input a set of embeddings of dimension C1 and outputs a set of
-    embedding of dimension C2, after a linear transformation, dropout and normalization (LN).
-    """
-
     def __init__(self, input_feat_size, output_feat_size, dropout, do_ln=True):
         super().__init__()
         self.do_ln = do_ln
-        # Object feature encoding
         self.fc = nn.Linear(input_feat_size, output_feat_size, bias=True)
         self.layer_norm = nn.LayerNorm(output_feat_size, eps=1e-12)
         self.dropout = nn.Dropout(dropout)
@@ -340,8 +337,7 @@ class FeatureResizer(nn.Module):
         x = self.fc(encoder_features)
         if self.do_ln:
             x = self.layer_norm(x)
-        output = self.dropout(x)
-        return output
+        return self.dropout(x)
 
 
 def build(args):
@@ -352,13 +348,12 @@ def build(args):
             num_classes = 65
         elif args.dataset_file == 'davis':
             num_classes = 78
-        elif args.dataset_file == 'a2d' or args.dataset_file == 'jhmdb':
+        elif args.dataset_file in ['a2d', 'jhmdb']:
             num_classes = 1
         else:
-            num_classes = 91  # for coco
+            num_classes = 91
     device = torch.device(args.device)
 
-    # backbone
     if 'video_swin' in args.backbone:
         from .video_swin_transformer import build_video_swin_backbone
         backbone = build_video_swin_backbone(args)
@@ -383,14 +378,14 @@ def build(args):
         freeze_text_encoder=args.freeze_text_encoder
     )
     matcher = build_matcher(args)
-    weight_dict = {}
-    weight_dict['loss_ce'] = args.cls_loss_coef
-    weight_dict['loss_bbox'] = args.bbox_loss_coef
-    weight_dict['loss_giou'] = args.giou_loss_coef
-    if args.masks:  # always true
+    weight_dict = {
+        'loss_ce': args.cls_loss_coef,
+        'loss_bbox': args.bbox_loss_coef,
+        'loss_giou': args.giou_loss_coef
+    }
+    if args.masks:
         weight_dict['loss_mask'] = args.mask_loss_coef
         weight_dict['loss_dice'] = args.dice_loss_coef
-    # TODO this is a hack
     if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
@@ -408,7 +403,5 @@ def build(args):
         losses=losses,
         focal_alpha=args.focal_alpha)
     criterion.to(device)
-
-    # postprocessors, this is used for coco pretrain but not for rvos
     postprocessors = build_postprocessors(args, args.dataset_file)
     return model, criterion, postprocessors
