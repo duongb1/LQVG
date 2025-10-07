@@ -13,22 +13,65 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
 from .position_encoding import PositionEmbeddingSine1D
 from .backbone import build_backbone
 from .deformable_transformer import build_deforamble_transformer
-from .segmentation import VisionLanguageFusionModule
+# NOTE: KHÔNG dùng bản cũ trong segmentation nữa
+# from .segmentation import VisionLanguageFusionModule
 from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
 
-from transformers import BertTokenizer, BertModel, RobertaModel, RobertaTokenizerFast
+from transformers import RobertaModel, RobertaTokenizerFast
 
 import copy
 from einops import rearrange, repeat
 
 
 def _get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
+    return nn.ModuleList([copy.deepcopy(module) for _ in range(N)])
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"  # disable HF tokenizer warning
+
+
+# === NEW: Vision-Language Fusion block (MHA + FFN), pre-norm, residual ===
+class VisionLanguageFusionModule(nn.Module):
+    """
+    Drop-in replacement cho module cũ:
+      - Pre-norm: LN -> MHA -> resid; LN -> FFN -> resid
+      - FFN: d -> 4d -> d
+      - API giữ nguyên: forward(tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None)
+    """
+    def __init__(self, d_model, nhead, dropout=0.1, ffn_mult=4):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, ffn_mult * d_model),
+            nn.ReLU(inplace=True),
+            nn.Linear(ffn_mult * d_model, d_model),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+
+    @staticmethod
+    def _with_pos(x, pos):
+        return x if pos is None else x + pos
+
+    def forward(self, tgt, memory,
+                memory_key_padding_mask=None,
+                pos=None,
+                query_pos=None):
+        # tgt, memory shape: [L, B, C] (đúng như bạn đang dùng)
+        x = self.norm1(tgt)
+        q = self._with_pos(x, query_pos)
+        k = self._with_pos(memory, pos)
+        v = memory
+        attn_out = self.mha(q, k, v, key_padding_mask=memory_key_padding_mask)[0]
+        x = tgt + self.drop(attn_out)
+
+        y = self.norm2(x)
+        y = self.ffn(y)
+        x = x + self.drop(y)
+        return x
 
 
 class LQVG(nn.Module):
@@ -114,20 +157,36 @@ class LQVG(nn.Module):
         )
 
         # === Fusion modules ===
-        self.fusion_module = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
-        self.fusion_module_text = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
+        # LVI (text <- vision) và VLI stack (vision <- text) đều dùng block mới (MHA+FFN)
+        self.fusion_module_text = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8, dropout=0.1, ffn_mult=4)
 
-        # === Progressive 3-layer VLI stack ===
-        self.vli_layers = nn.ModuleList([
-            self.fusion_module,
-            VisionLanguageFusionModule(d_model=hidden_dim, nhead=8),
-            VisionLanguageFusionModule(d_model=hidden_dim, nhead=8)
-        ])
+        # === Progressive 3-layer VLI stack (independent modules) ===
+        base_vli = VisionLanguageFusionModule(d_model=hidden_dim, nhead=8, dropout=0.1, ffn_mult=4)
+        self.vli_layers = nn.ModuleList([copy.deepcopy(base_vli) for _ in range(3)])
         self.vli_norms = nn.ModuleList([nn.LayerNorm(hidden_dim) for _ in range(3)])
         self.vli_res_scale = 0.7
 
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
         self.poolout_module = RobertaPoolout(d_model=hidden_dim)
+
+        # optional debug
+        if os.environ.get("LQVG_DEBUG", "0") == "1":
+            self._debug_vli_once()
+
+    def _debug_vli_once(self):
+        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        vli_total = sum(p.numel() for n, p in self.named_parameters() if "vli_layers" in n)
+        print(f"\n[LQVG_DEBUG] Trainable total: {total} (= {total/1e6:.3f}M)")
+        print(f"[LQVG_DEBUG] VLI total:       {vli_total} (= {vli_total/1e6:.3f}M)")
+        for i, lyr in enumerate(self.vli_layers):
+            cnt = sum(p.numel() for p in lyr.parameters() if p.requires_grad)
+            print(f"  - vli_layers[{i}]: {cnt} (= {cnt/1e6:.3f}M)")
+        try:
+            p0 = next(self.vli_layers[0].parameters())
+            p1 = next(self.vli_layers[1].parameters())
+            print(f"[LQVG_DEBUG] param id L0={id(p0)} L1={id(p1)} (diff -> OK)")
+        except StopIteration:
+            print("[LQVG_DEBUG] VLI has no params?")
 
     def forward(self, samples: NestedTensor, captions, targets):
 
@@ -168,7 +227,7 @@ class LQVG(nn.Module):
             mask = rearrange(mask, '(b t) h w -> b (t h w)', b=b, t=t)
             pos_l = rearrange(pos_l, '(b t) c h w -> (t h w) b c', b=b, t=t)
 
-            # LVI
+            # LVI: text <- vision
             text_word_features = self.fusion_module_text(
                 tgt=text_word_features,
                 memory=src_proj_l,
@@ -176,7 +235,7 @@ class LQVG(nn.Module):
                 pos=pos_l,
                 query_pos=None)
 
-            # === Progressive 3-layer VLI ===
+            # === Progressive 3-layer VLI === (vision <- text)
             v_cur = src_proj_l
             for i in range(3):
                 v_in = v_cur
