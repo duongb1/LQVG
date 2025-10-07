@@ -408,11 +408,11 @@ class VisionLanguageBlock(nn.Module):
 
 
 class VisionLanguageFusionModule(nn.Module):
-    def __init__(self, d_model, nhead, dropout=0.0):
+    def __init__(self, d_model, nhead, dropout=0.1):
         super().__init__()
         self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # self.dropout = nn.Dropout(dropout)
-        # self.norm = nn.LayerNorm(d_model)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -421,14 +421,19 @@ class VisionLanguageFusionModule(nn.Module):
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
                 query_pos: Optional[Tensor] = None):
-        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                   key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=None,
-                                   key_padding_mask=memory_key_padding_mask)[0]
-        tgt = tgt * tgt2
-        # tgt = tgt + tgt2
-        # tgt = self.norm(tgt + self.dropout(tgt2))
+        # Pre-LN for stable stacking
+        tgt2 = self.norm(tgt)
+        attn_out = self.multihead_attn(
+            query=self.with_pos_embed(tgt2, query_pos),
+            key=self.with_pos_embed(memory, pos),
+            value=memory,
+            attn_mask=None,
+            key_padding_mask=memory_key_padding_mask
+        )[0]
+        # Residual fusion with dropout
+        tgt = tgt + self.dropout(attn_out)
         return tgt
+
 
 
 def dice_loss(inputs, targets, num_boxes):
