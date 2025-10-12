@@ -16,6 +16,7 @@ from datasets import build_dataset
 from models import build_model
 from tools.colormap import colormap
 import opts
+from PIL import ImageFont
 
 add_safe_globals([Namespace])
 
@@ -23,7 +24,7 @@ add_safe_globals([Namespace])
 color_list = colormap()
 color_list = color_list.astype('uint8').tolist()
 # visualization
-Visualize_bbox = True
+Visualize_bbox = False
 save_visualize_path_prefix = "test_output"
 version = "test"
 
@@ -163,6 +164,11 @@ def evaluate(test_loader, model, args):
 
             draw.rectangle(((xmin, ymin), (xmax, ymax)), outline=tuple(color_list[9]), width=4)
             draw.rectangle(((xmin_gt, ymin_gt), (xmax_gt, ymax_gt)), outline=tuple(color_list[0]), width=4)
+            # --- vẽ caption đơn giản ---
+            
+            caption_text = str(captions[0]) if isinstance(captions, (list, tuple)) else str(captions)
+            font = ImageFont.truetype("arial.ttf", size=36)
+            draw.text((20, 20), caption_text, fill=(255, 0, 0), font=font)
             # fontStyle = ImageFont.truetype("SimHei.ttf", 30)
             # draw.text((20, 20), captions[0], (200, 0, 0), font=fontStyle)
             # save
