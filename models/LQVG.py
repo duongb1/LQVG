@@ -17,7 +17,7 @@ from .matcher import build_matcher
 from .criterion import SetCriterion
 from .postprocessors import build_postprocessors
 
-from transformers import RobertaModel, RobertaTokenizerFast
+from transformers import BertModel, BertTokenizerFast
 
 import copy
 from einops import rearrange, repeat
@@ -143,8 +143,8 @@ class LQVG(nn.Module):
             self.transformer.decoder.bbox_embed = None
 
         # ===== Text encoder =====
-        self.tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-        self.text_encoder = RobertaModel.from_pretrained('roberta-base')
+        self.tokenizer = BertTokenizerFast.from_pretrained('bert-base-uncased')
+        self.text_encoder = BertModel.from_pretrained('bert-base-uncased')
         if freeze_text_encoder:
             for p in self.text_encoder.parameters():
                 p.requires_grad_(False)
@@ -169,7 +169,7 @@ class LQVG(nn.Module):
         self.vli_per_scale = nn.ModuleList([make_vli_stack() for _ in range(self.num_feature_levels)])
 
         self.text_pos = PositionEmbeddingSine1D(hidden_dim, normalize=True)
-        self.poolout_module = RobertaPoolout(d_model=hidden_dim)
+        self.poolout_module = BertPoolout(d_model=hidden_dim)
 
         # Optional: debug sizes
         if os.environ.get("LQVG_DEBUG", "0") == "1":
@@ -382,7 +382,7 @@ class MLP(nn.Module):
         return x
 
 
-class RobertaPoolout(nn.Module):
+class BertPoolout(nn.Module):
     def __init__(self, d_model):
         super().__init__()
         self.dense = nn.Linear(d_model, d_model)
